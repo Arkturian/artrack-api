@@ -669,6 +669,7 @@ class WaypointUpdate(BaseModel):
     description: Optional[str] = None
     tags: Optional[List[str]] = None
     priority: Optional[float] = None  # -1.0 to 1.0, higher = more important
+    metadata_json: Optional[dict] = None  # Full metadata override (merges with existing)
 
 # --- Chunked Uploads (optional) ---
 
@@ -917,6 +918,14 @@ async def update_waypoint(
         meta["title"] = update.title
     if update.tags is not None:
         meta["tags"] = update.tags
+    # Merge metadata_json if provided (deep merge for nested objects like segment)
+    if update.metadata_json is not None:
+        for key, value in update.metadata_json.items():
+            if isinstance(value, dict) and isinstance(meta.get(key), dict):
+                # Deep merge for nested dicts (e.g., segment, snap)
+                meta[key] = {**meta[key], **value}
+            else:
+                meta[key] = value
     waypoint.metadata_json = meta
     flag_modified(waypoint, "metadata_json")  # Explicitly mark JSON field as modified for SQLAlchemy
 
