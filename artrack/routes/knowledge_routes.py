@@ -32,6 +32,11 @@ import asyncio
 from ..database import get_db, SessionLocal
 from ..models import Track, Waypoint, TrackRoute
 from ..auth import get_current_user, User
+from ..content_client import (
+    get_narration_knowledge,
+    save_narration_knowledge,
+    delete_narration_post,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -463,77 +468,133 @@ def get_track_knowledge(
     if track.visibility == "private" and track.created_by != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Load all track data
+    # Load structural data (route/segment/poi names, IDs)
     data = _load_track_data(db, track_id)
 
-    # Get config from track metadata (or first route)
-    track_metadata = track.metadata_json or {}
-    config = track_metadata.get("knowledge_config", {})
+    # Try content-api first
+    content_knowledge = get_narration_knowledge(track_id)
 
-    # Build response
-    knowledge = {
-        "version": 3,
-        "config": config,
-        "routes": {},
-        "segments": {},
-        "pois": {}
-    }
+    if content_knowledge:
+        # Merge structural data with content-api texts
+        knowledge = content_knowledge
+        knowledge.setdefault("version", 3)
 
-    # Load route knowledge
-    for route in data["routes"]:
-        route_metadata = route.metadata_json or {}
-        route_knowledge = route_metadata.get("knowledge", {})
+        # Ensure config is present (fallback to track metadata)
+        if not knowledge.get("config"):
+            track_metadata = track.metadata_json or {}
+            knowledge["config"] = track_metadata.get("knowledge_config", {})
 
-        knowledge["routes"][str(route.id)] = {
-            "id": route.id,
-            "name": route.name,
-            "description": route.description or "",
-            "intro": route_knowledge.get("intro", {"text": "", "edited": False}),
-            "outro": route_knowledge.get("outro", {"text": "", "edited": False})
+        # Ensure all current routes/segments/pois are represented
+        # (structure may have changed since last save)
+        for route in data["routes"]:
+            rid = str(route.id)
+            if rid not in knowledge.get("routes", {}):
+                knowledge.setdefault("routes", {})[rid] = {
+                    "id": route.id,
+                    "name": route.name,
+                    "description": route.description or "",
+                    "intro": {"text": "", "edited": False},
+                    "outro": {"text": "", "edited": False}
+                }
+            else:
+                # Update structural fields
+                knowledge["routes"][rid]["id"] = route.id
+                knowledge["routes"][rid]["name"] = route.name
+                knowledge["routes"][rid]["description"] = route.description or ""
+
+        for seg_name, seg_data in data["segments"].items():
+            if seg_name not in knowledge.get("segments", {}):
+                knowledge.setdefault("segments", {})[seg_name] = {
+                    "name": seg_name,
+                    "description": seg_data.get("description", ""),
+                    "start_waypoint_id": seg_data["start_wp"].id if seg_data.get("start_wp") else None,
+                    "end_waypoint_id": seg_data["end_wp"].id if seg_data.get("end_wp") else None,
+                    "entry": {"text": "", "edited": False},
+                    "exit": {"text": "", "edited": False}
+                }
+            else:
+                knowledge["segments"][seg_name]["start_waypoint_id"] = seg_data["start_wp"].id if seg_data.get("start_wp") else None
+                knowledge["segments"][seg_name]["end_waypoint_id"] = seg_data["end_wp"].id if seg_data.get("end_wp") else None
+
+        for poi in data["pois"]:
+            pid = str(poi.id)
+            poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
+            if pid not in knowledge.get("pois", {}):
+                knowledge.setdefault("pois", {})[pid] = {
+                    "waypoint_id": poi.id,
+                    "name": poi_name,
+                    "description": poi.user_description or "",
+                    "approaching": {"text": "", "edited": False},
+                    "at_poi": {"text": "", "edited": False}
+                }
+            else:
+                knowledge["pois"][pid]["name"] = poi_name
+                knowledge["pois"][pid]["description"] = poi.user_description or ""
+
+        logger.info(f"Loaded knowledge for track {track_id} from content-api")
+    else:
+        # Fallback: load from local metadata_json (backward compatibility)
+        track_metadata = track.metadata_json or {}
+        config = track_metadata.get("knowledge_config", {})
+
+        knowledge = {
+            "version": 3,
+            "config": config,
+            "routes": {},
+            "segments": {},
+            "pois": {}
         }
 
-    # Load segment knowledge
-    for seg_name, seg_data in data["segments"].items():
-        start_wp = seg_data.get("start_wp")
-        end_wp = seg_data.get("end_wp")
+        for route in data["routes"]:
+            route_metadata = route.metadata_json or {}
+            route_knowledge = route_metadata.get("knowledge", {})
+            knowledge["routes"][str(route.id)] = {
+                "id": route.id,
+                "name": route.name,
+                "description": route.description or "",
+                "intro": route_knowledge.get("intro", {"text": "", "edited": False}),
+                "outro": route_knowledge.get("outro", {"text": "", "edited": False})
+            }
 
-        start_knowledge = _get_waypoint_knowledge(start_wp) or {}
-        end_knowledge = _get_waypoint_knowledge(end_wp) or {}
+        for seg_name, seg_data in data["segments"].items():
+            start_wp = seg_data.get("start_wp")
+            end_wp = seg_data.get("end_wp")
+            start_knowledge = _get_waypoint_knowledge(start_wp) or {}
+            end_knowledge = _get_waypoint_knowledge(end_wp) or {}
+            knowledge["segments"][seg_name] = {
+                "name": seg_name,
+                "description": seg_data.get("description", ""),
+                "start_waypoint_id": start_wp.id if start_wp else None,
+                "end_waypoint_id": end_wp.id if end_wp else None,
+                "entry": start_knowledge.get("entry", {"text": "", "edited": False}),
+                "exit": end_knowledge.get("exit", {"text": "", "edited": False})
+            }
 
-        knowledge["segments"][seg_name] = {
-            "name": seg_name,
-            "description": seg_data.get("description", ""),
-            "start_waypoint_id": start_wp.id if start_wp else None,
-            "end_waypoint_id": end_wp.id if end_wp else None,
-            "entry": start_knowledge.get("entry", {"text": "", "edited": False}),
-            "exit": end_knowledge.get("exit", {"text": "", "edited": False})
-        }
+        for poi in data["pois"]:
+            poi_knowledge = _get_waypoint_knowledge(poi) or {}
+            poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
+            knowledge["pois"][str(poi.id)] = {
+                "waypoint_id": poi.id,
+                "name": poi_name,
+                "description": poi.user_description or "",
+                "approaching": poi_knowledge.get("approaching", {"text": "", "edited": False}),
+                "at_poi": poi_knowledge.get("at_poi", {"text": "", "edited": False})
+            }
 
-    # Load POI knowledge
-    for poi in data["pois"]:
-        poi_knowledge = _get_waypoint_knowledge(poi) or {}
-        poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
-
-        knowledge["pois"][str(poi.id)] = {
-            "waypoint_id": poi.id,
-            "name": poi_name,
-            "description": poi.user_description or "",
-            "approaching": poi_knowledge.get("approaching", {"text": "", "edited": False}),
-            "at_poi": poi_knowledge.get("at_poi", {"text": "", "edited": False})
-        }
+        logger.info(f"Loaded knowledge for track {track_id} from local metadata (content-api fallback)")
 
     # Check if any knowledge exists
     has_route_texts = any(
         r.get("intro", {}).get("text") or r.get("outro", {}).get("text")
-        for r in knowledge["routes"].values()
+        for r in knowledge.get("routes", {}).values()
     )
     has_segment_texts = any(
         s.get("entry", {}).get("text") or s.get("exit", {}).get("text")
-        for s in knowledge["segments"].values()
+        for s in knowledge.get("segments", {}).values()
     )
     has_poi_texts = any(
         p.get("approaching", {}).get("text") or p.get("at_poi", {}).get("text")
-        for p in knowledge["pois"].values()
+        for p in knowledge.get("pois", {}).values()
     )
 
     return {
@@ -803,33 +864,52 @@ async def _run_generation_job(job_id: str, track_id: int, body_dict: dict, user_
         # Load existing knowledge if only_missing mode
         existing_knowledge = {"routes": {}, "segments": {}, "pois": {}}
         if only_missing:
-            # Load existing route knowledge
-            for route in data["routes"]:
-                route_metadata = route.metadata_json or {}
-                route_knowledge = route_metadata.get("knowledge", {})
-                existing_knowledge["routes"][str(route.id)] = {
-                    "intro": route_knowledge.get("intro", {}).get("text", ""),
-                    "outro": route_knowledge.get("outro", {}).get("text", "")
-                }
+            # Try content-api first
+            content_knowledge = get_narration_knowledge(track_id)
+            if content_knowledge:
+                for rid, rdata in content_knowledge.get("routes", {}).items():
+                    existing_knowledge["routes"][rid] = {
+                        "intro": rdata.get("intro", {}).get("text", "") if isinstance(rdata.get("intro"), dict) else "",
+                        "outro": rdata.get("outro", {}).get("text", "") if isinstance(rdata.get("outro"), dict) else ""
+                    }
+                for sname, sdata in content_knowledge.get("segments", {}).items():
+                    existing_knowledge["segments"][sname] = {
+                        "entry": sdata.get("entry", {}).get("text", "") if isinstance(sdata.get("entry"), dict) else "",
+                        "exit": sdata.get("exit", {}).get("text", "") if isinstance(sdata.get("exit"), dict) else ""
+                    }
+                for pid, pdata in content_knowledge.get("pois", {}).items():
+                    existing_knowledge["pois"][pid] = {
+                        "approaching": pdata.get("approaching", {}).get("text", "") if isinstance(pdata.get("approaching"), dict) else "",
+                        "at_poi": pdata.get("at_poi", {}).get("text", "") if isinstance(pdata.get("at_poi"), dict) else ""
+                    }
+                logger.info(f"Generation job {job_id}: loaded existing knowledge from content-api")
+            else:
+                # Fallback to local metadata
+                for route in data["routes"]:
+                    route_metadata = route.metadata_json or {}
+                    route_knowledge = route_metadata.get("knowledge", {})
+                    existing_knowledge["routes"][str(route.id)] = {
+                        "intro": route_knowledge.get("intro", {}).get("text", ""),
+                        "outro": route_knowledge.get("outro", {}).get("text", "")
+                    }
 
-            # Load existing segment knowledge
-            for seg_name, seg_data in data["segments"].items():
-                start_wp = seg_data.get("start_wp")
-                end_wp = seg_data.get("end_wp")
-                start_knowledge = _get_waypoint_knowledge(start_wp) or {}
-                end_knowledge = _get_waypoint_knowledge(end_wp) or {}
-                existing_knowledge["segments"][seg_name] = {
-                    "entry": start_knowledge.get("entry", {}).get("text", ""),
-                    "exit": end_knowledge.get("exit", {}).get("text", "")
-                }
+                for seg_name, seg_data in data["segments"].items():
+                    start_wp = seg_data.get("start_wp")
+                    end_wp = seg_data.get("end_wp")
+                    start_knowledge = _get_waypoint_knowledge(start_wp) or {}
+                    end_knowledge = _get_waypoint_knowledge(end_wp) or {}
+                    existing_knowledge["segments"][seg_name] = {
+                        "entry": start_knowledge.get("entry", {}).get("text", ""),
+                        "exit": end_knowledge.get("exit", {}).get("text", "")
+                    }
 
-            # Load existing POI knowledge
-            for poi in data["pois"]:
-                poi_knowledge = _get_waypoint_knowledge(poi) or {}
-                existing_knowledge["pois"][str(poi.id)] = {
-                    "approaching": poi_knowledge.get("approaching", {}).get("text", ""),
-                    "at_poi": poi_knowledge.get("at_poi", {}).get("text", "")
-                }
+                for poi in data["pois"]:
+                    poi_knowledge = _get_waypoint_knowledge(poi) or {}
+                    existing_knowledge["pois"][str(poi.id)] = {
+                        "approaching": poi_knowledge.get("approaching", {}).get("text", ""),
+                        "at_poi": poi_knowledge.get("at_poi", {}).get("text", "")
+                    }
+                logger.info(f"Generation job {job_id}: loaded existing knowledge from local metadata")
 
         knowledge = {
             "version": 3,
@@ -842,44 +922,80 @@ async def _run_generation_job(job_id: str, track_id: int, body_dict: dict, user_
 
         # If only_missing, pre-populate with existing knowledge
         if only_missing:
-            # Pre-populate routes
-            for route in data["routes"]:
-                route_metadata = route.metadata_json or {}
-                route_knowledge = route_metadata.get("knowledge", {})
-                knowledge["routes"][str(route.id)] = {
-                    "id": route.id,
-                    "name": route.name,
-                    "description": route.description or "",
-                    "intro": route_knowledge.get("intro", {"text": "", "text_original": "", "edited": False}),
-                    "outro": route_knowledge.get("outro", {"text": "", "text_original": "", "edited": False})
-                }
+            if content_knowledge:
+                # Pre-populate from content-api
+                for route in data["routes"]:
+                    rid = str(route.id)
+                    ck_route = content_knowledge.get("routes", {}).get(rid, {})
+                    knowledge["routes"][rid] = {
+                        "id": route.id,
+                        "name": route.name,
+                        "description": route.description or "",
+                        "intro": ck_route.get("intro", {"text": "", "text_original": "", "edited": False}),
+                        "outro": ck_route.get("outro", {"text": "", "text_original": "", "edited": False})
+                    }
 
-            # Pre-populate segments
-            for seg_name, seg_data in data["segments"].items():
-                start_wp = seg_data.get("start_wp")
-                end_wp = seg_data.get("end_wp")
-                start_knowledge = _get_waypoint_knowledge(start_wp) or {}
-                end_knowledge = _get_waypoint_knowledge(end_wp) or {}
-                knowledge["segments"][seg_name] = {
-                    "name": seg_name,
-                    "description": seg_data.get("description", ""),
-                    "start_waypoint_id": start_wp.id if start_wp else None,
-                    "end_waypoint_id": end_wp.id if end_wp else None,
-                    "entry": start_knowledge.get("entry", {"text": "", "text_original": "", "edited": False}),
-                    "exit": end_knowledge.get("exit", {"text": "", "text_original": "", "edited": False})
-                }
+                for seg_name, seg_data in data["segments"].items():
+                    start_wp = seg_data.get("start_wp")
+                    end_wp = seg_data.get("end_wp")
+                    ck_seg = content_knowledge.get("segments", {}).get(seg_name, {})
+                    knowledge["segments"][seg_name] = {
+                        "name": seg_name,
+                        "description": seg_data.get("description", ""),
+                        "start_waypoint_id": start_wp.id if start_wp else None,
+                        "end_waypoint_id": end_wp.id if end_wp else None,
+                        "entry": ck_seg.get("entry", {"text": "", "text_original": "", "edited": False}),
+                        "exit": ck_seg.get("exit", {"text": "", "text_original": "", "edited": False})
+                    }
 
-            # Pre-populate POIs
-            for poi in data["pois"]:
-                poi_knowledge = _get_waypoint_knowledge(poi) or {}
-                poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
-                knowledge["pois"][str(poi.id)] = {
-                    "waypoint_id": poi.id,
-                    "name": poi_name,
-                    "description": poi.user_description or "",
-                    "approaching": poi_knowledge.get("approaching", {"text": "", "text_original": "", "edited": False}),
-                    "at_poi": poi_knowledge.get("at_poi", {"text": "", "text_original": "", "edited": False})
-                }
+                for poi in data["pois"]:
+                    pid = str(poi.id)
+                    poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
+                    ck_poi = content_knowledge.get("pois", {}).get(pid, {})
+                    knowledge["pois"][pid] = {
+                        "waypoint_id": poi.id,
+                        "name": poi_name,
+                        "description": poi.user_description or "",
+                        "approaching": ck_poi.get("approaching", {"text": "", "text_original": "", "edited": False}),
+                        "at_poi": ck_poi.get("at_poi", {"text": "", "text_original": "", "edited": False})
+                    }
+            else:
+                # Fallback: pre-populate from local metadata
+                for route in data["routes"]:
+                    route_metadata = route.metadata_json or {}
+                    route_knowledge = route_metadata.get("knowledge", {})
+                    knowledge["routes"][str(route.id)] = {
+                        "id": route.id,
+                        "name": route.name,
+                        "description": route.description or "",
+                        "intro": route_knowledge.get("intro", {"text": "", "text_original": "", "edited": False}),
+                        "outro": route_knowledge.get("outro", {"text": "", "text_original": "", "edited": False})
+                    }
+
+                for seg_name, seg_data in data["segments"].items():
+                    start_wp = seg_data.get("start_wp")
+                    end_wp = seg_data.get("end_wp")
+                    start_knowledge = _get_waypoint_knowledge(start_wp) or {}
+                    end_knowledge = _get_waypoint_knowledge(end_wp) or {}
+                    knowledge["segments"][seg_name] = {
+                        "name": seg_name,
+                        "description": seg_data.get("description", ""),
+                        "start_waypoint_id": start_wp.id if start_wp else None,
+                        "end_waypoint_id": end_wp.id if end_wp else None,
+                        "entry": start_knowledge.get("entry", {"text": "", "text_original": "", "edited": False}),
+                        "exit": end_knowledge.get("exit", {"text": "", "text_original": "", "edited": False})
+                    }
+
+                for poi in data["pois"]:
+                    poi_knowledge = _get_waypoint_knowledge(poi) or {}
+                    poi_name = (poi.metadata_json or {}).get("title", f"POI #{poi.id}")
+                    knowledge["pois"][str(poi.id)] = {
+                        "waypoint_id": poi.id,
+                        "name": poi_name,
+                        "description": poi.user_description or "",
+                        "approaching": poi_knowledge.get("approaching", {"text": "", "text_original": "", "edited": False}),
+                        "at_poi": poi_knowledge.get("at_poi", {"text": "", "text_original": "", "edited": False})
+                    }
 
         # Build task list
         task_list = []
@@ -1321,13 +1437,27 @@ def save_track_knowledge(
 
     db.commit()
 
+    # Save to content-api (primary storage)
+    content_post_id = save_narration_knowledge(track_id, track.name, knowledge)
+    if content_post_id:
+        logger.info(f"Saved knowledge to content-api post {content_post_id} for track {track_id}")
+        # Store reference in track metadata
+        track_metadata = track.metadata_json or {}
+        track_metadata["content_narration_post_id"] = content_post_id
+        track.metadata_json = track_metadata
+        flag_modified(track, "metadata_json")
+        db.commit()
+    else:
+        logger.warning(f"Failed to save knowledge to content-api for track {track_id}, local save succeeded")
+
     return {
         "success": True,
         "track_id": track_id,
         "saved_at": datetime.utcnow().isoformat() + "Z",
         "saved_routes": len(routes_knowledge),
         "saved_segments": len(segments_knowledge),
-        "saved_pois": len(pois_knowledge)
+        "saved_pois": len(pois_knowledge),
+        "content_post_id": content_post_id
     }
 
 
@@ -1604,6 +1734,30 @@ async def generate_knowledge_audio(
 
         db.commit()
 
+    # Also update content-api with cue data
+    content_knowledge = get_narration_knowledge(track_id)
+    if content_knowledge and source_obj:
+        try:
+            section_map = {"route": "routes", "segment": "segments", "poi": "pois"}
+            section = section_map.get(body.item_type)
+            if section and body.item_id in content_knowledge.get(section, {}):
+                item_data = content_knowledge[section][body.item_id]
+                if body.text_type in item_data:
+                    item_data[body.text_type]["cues"] = [
+                        {
+                            "index": c["index"],
+                            "text": c["text"],
+                            "audio_storage_id": c.get("audio_storage_id"),
+                            "duration_seconds": c.get("duration_seconds")
+                        }
+                        for c in cues_result
+                    ]
+                    item_data[body.text_type]["total_duration"] = total_duration
+                    save_narration_knowledge(track_id, track.name, content_knowledge)
+                    logger.info(f"Updated content-api with audio cues for {body.item_type} {body.item_id}")
+        except Exception as e:
+            logger.warning(f"Failed to update content-api with audio cues: {e}")
+
     # Count successful cues
     successful_cues = sum(1 for c in cues_result if c.get("audio_storage_id"))
 
@@ -1670,4 +1824,11 @@ def delete_track_knowledge(
 
     db.commit()
 
-    return {"success": True, "deleted": True}
+    # Delete from content-api
+    content_deleted = delete_narration_post(track_id)
+    if content_deleted:
+        logger.info(f"Deleted narration post from content-api for track {track_id}")
+    else:
+        logger.warning(f"Failed to delete narration post from content-api for track {track_id}")
+
+    return {"success": True, "deleted": True, "content_deleted": content_deleted}

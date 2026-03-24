@@ -33,6 +33,9 @@ class Settings:
     
     # AI Services (using existing endpoints on SAME FastAPI instance)
     AI_BASE_URL: str = os.getenv("AI_BASE_URL", "http://localhost:8001")
+
+    # Content API (for narration storage)
+    CONTENT_API_BASE: str = os.getenv("CONTENT_API_BASE", "https://content-api.arkturian.com")
     
     # Media Settings
     MAX_FILE_SIZE: int = int(os.getenv("ARTRACK_MAX_FILE_SIZE", "52428800"))  # 50MB
