@@ -34,7 +34,7 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
     """
     slug = _slug_for_track(track_id)
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             # Try to find by slug via posts list endpoint
             resp = client.get(
                 f"{CONTENT_API_BASE}/api/v1/posts/",
@@ -133,7 +133,7 @@ def save_narration_knowledge(
     try:
         existing = get_narration_post(track_id)
 
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             if existing:
                 # Update existing post
                 post_id = existing["id"]
@@ -179,7 +179,7 @@ def delete_narration_post(track_id: int) -> bool:
 
     post_id = existing["id"]
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             resp = client.delete(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/")
             if resp.status_code in (200, 204):
                 logger.info(f"Deleted narration post {post_id} for track {track_id}")
