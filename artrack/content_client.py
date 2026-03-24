@@ -37,7 +37,7 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
         with httpx.Client(timeout=15.0) as client:
             # Try to find by slug via posts list endpoint
             resp = client.get(
-                f"{CONTENT_API_BASE}/api/v1/posts",
+                f"{CONTENT_API_BASE}/api/v1/posts/",
                 params={"doc_type": DOC_TYPE, "partner_id": PARTNER_ID, "limit": 100}
             )
             if resp.status_code != 200:
@@ -51,14 +51,14 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
             for post in posts:
                 if post.get("slug") == slug:
                     # Fetch full details
-                    detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}")
+                    detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}/")
                     if detail_resp.status_code == 200:
                         return detail_resp.json()
                     return post
 
                 meta = post.get("metadata_json") or {}
                 if meta.get("track_id") == track_id:
-                    detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}")
+                    detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}/")
                     if detail_resp.status_code == 200:
                         return detail_resp.json()
                     return post
@@ -138,7 +138,7 @@ def save_narration_knowledge(
                 # Update existing post
                 post_id = existing["id"]
                 resp = client.put(
-                    f"{CONTENT_API_BASE}/api/v1/posts/{post_id}",
+                    f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/",
                     json=post_data
                 )
                 if resp.status_code == 200:
@@ -150,7 +150,7 @@ def save_narration_knowledge(
             else:
                 # Create new post
                 resp = client.post(
-                    f"{CONTENT_API_BASE}/api/v1/posts",
+                    f"{CONTENT_API_BASE}/api/v1/posts/",
                     json=post_data
                 )
                 if resp.status_code in (200, 201):
@@ -180,7 +180,7 @@ def delete_narration_post(track_id: int) -> bool:
     post_id = existing["id"]
     try:
         with httpx.Client(timeout=15.0) as client:
-            resp = client.delete(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}")
+            resp = client.delete(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/")
             if resp.status_code in (200, 204):
                 logger.info(f"Deleted narration post {post_id} for track {track_id}")
                 return True
