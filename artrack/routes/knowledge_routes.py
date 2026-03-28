@@ -532,6 +532,15 @@ def get_track_knowledge(
             knowledge["pois"][pid]["name"] = poi_name
             knowledge["pois"][pid]["description"] = poi.user_description or ""
 
+        # Merge radius and priority from waypoint metadata
+        poi_meta = poi.metadata_json or {}
+        radius = poi_meta.get("radiusMeters")
+        if radius and isinstance(radius, (int, float)):
+            knowledge["pois"][pid]["at_poi_radius"] = radius
+            knowledge["pois"][pid]["approaching_radius"] = int(radius * 3)
+        if poi.priority is not None:
+            knowledge["pois"][pid]["priority"] = poi.priority
+
     logger.info(f"Loaded knowledge for track {track_id} from content-api (exists={content_knowledge is not None})")
 
     # Check if any knowledge exists (v4: texts under narrations.<character>.<type>)
