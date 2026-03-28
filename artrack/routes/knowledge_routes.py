@@ -534,20 +534,68 @@ def get_track_knowledge(
 
     logger.info(f"Loaded knowledge for track {track_id} from content-api (exists={content_knowledge is not None})")
 
-    # Check if any knowledge exists
-    has_route_texts = any(
-        r.get("intro", {}).get("text") or r.get("outro", {}).get("text")
-        for r in knowledge.get("routes", {}).values()
-    )
-    has_segment_texts = any(
-        s.get("entry", {}).get("text") or s.get("exit", {}).get("text")
-        for s in knowledge.get("segments", {}).values()
-    )
-    has_poi_texts = any(
-        p.get("approaching", {}).get("text") or p.get("at_poi", {}).get("text")
-        for p in knowledge.get("pois", {}).values()
-    )
+    # Check if any knowledge exists (v4: texts under narrations.<character>.<type>)
+    def _has_narration_texts(items, text_keys):
+        for item in items.values():
+            # v4 format: narrations.character_id.text_type.text
+            narrations = item.get("narrations", {})
+            for char_narr in narrations.values():
+                for key in text_keys:
+                    if char_narr.get(key, {}).get("text"):
+                        return True
+            # v3 compat: direct text_type.text
+            for key in text_keys:
+                if item.get(key, {}).get("text"):
+                    return True
+        return False
 
+    has_route_texts = _has_narration_texts(knowledge.get("routes", {}), ["intro", "outro"])
+    has_segment_texts = _has_narration_texts(knowledge.get("segments", {}), ["entry", "exit"])
+    has_poi_texts = _has_narration_texts(knowledge.get("pois", {}), ["approaching", "at_poi"])
+
+    # ── v4 → v3 flattening ──────────────────────────────────────
+    # The v4 format stores texts under narrations.<character_id>.<type>
+    # but all frontends expect v3 format: item.<type>.text directly.
+    # Flatten the selected character's narrations for backward compatibility.
+    from fastapi import Query as FastQuery
+    character_id = None  # Will be set from query param in future
+    if knowledge.get("version", 3) >= 4 and knowledge.get("characters"):
+        characters = knowledge.get("characters", [])
+        # Find default character or first one
+        default_char = next((c for c in characters if c.get("is_default")), characters[0] if characters else None)
+        char_id = character_id or (default_char["id"] if default_char else None)
+        
+        if char_id:
+            # Flatten routes
+            for rid, rdata in knowledge.get("routes", {}).items():
+                narrations = rdata.pop("narrations", {})
+                char_narr = narrations.get(char_id, {})
+                for key in ["intro", "outro"]:
+                    if key not in rdata or not rdata[key].get("text"):
+                        rdata[key] = char_narr.get(key, {"text": "", "edited": False})
+            
+            # Flatten segments
+            for sname, sdata in knowledge.get("segments", {}).items():
+                narrations = sdata.pop("narrations", {})
+                char_narr = narrations.get(char_id, {})
+                for key in ["entry", "exit"]:
+                    if key not in sdata or not sdata[key].get("text"):
+                        sdata[key] = char_narr.get(key, {"text": "", "edited": False})
+            
+            # Flatten POIs
+            for pid, pdata in knowledge.get("pois", {}).items():
+                narrations = pdata.pop("narrations", {})
+                char_narr = narrations.get(char_id, {})
+                for key in ["approaching", "at_poi"]:
+                    if key not in pdata or not pdata[key].get("text"):
+                        pdata[key] = char_narr.get(key, {"text": "", "edited": False})
+            
+            # Add character info to config for frontends
+            knowledge.setdefault("config", {})["active_character"] = char_id
+            knowledge["config"]["available_characters"] = [
+                {"id": c["id"], "name": c["name"]} for c in characters
+            ]
+    
     return {
         "exists": has_route_texts or has_segment_texts or has_poi_texts,
         "knowledge": knowledge,
@@ -1266,6 +1314,50 @@ def save_track_knowledge(
     knowledge = body.get("knowledge")
     if not knowledge:
         raise HTTPException(status_code=400, detail="Knowledge object required")
+
+    # ── v3 → v4 wrapping ──────────────────────────────────────
+    # If the frontend sends v3 format (flat texts), wrap into v4 narrations
+    if knowledge.get("version", 3) < 4:
+        # Detect active character from config or default
+        char_id = (knowledge.get("config") or {}).get("active_character", "dr_tschauko")
+        
+        for rid, rdata in knowledge.get("routes", {}).items():
+            if "narrations" not in rdata:
+                rdata["narrations"] = {char_id: {}}
+            char_narr = rdata["narrations"].setdefault(char_id, {})
+            for key in ["intro", "outro"]:
+                if key in rdata and isinstance(rdata[key], dict) and rdata[key].get("text"):
+                    char_narr[key] = rdata[key]  # Keep flat key for content-frontend compat
+        
+        for sname, sdata in knowledge.get("segments", {}).items():
+            if "narrations" not in sdata:
+                sdata["narrations"] = {char_id: {}}
+            char_narr = sdata["narrations"].setdefault(char_id, {})
+            for key in ["entry", "exit"]:
+                if key in sdata and isinstance(sdata[key], dict) and sdata[key].get("text"):
+                    char_narr[key] = sdata[key]  # Keep flat key for content-frontend compat
+        
+        for pid, pdata in knowledge.get("pois", {}).items():
+            if "narrations" not in pdata:
+                pdata["narrations"] = {char_id: {}}
+            char_narr = pdata["narrations"].setdefault(char_id, {})
+            for key in ["approaching", "at_poi"]:
+                if key in pdata and isinstance(pdata[key], dict) and pdata[key].get("text"):
+                    char_narr[key] = pdata[key]  # Keep flat key for content-frontend compat
+        
+        # Upgrade version
+        knowledge["version"] = 4
+        # Add characters if missing
+        if "characters" not in knowledge:
+            persona = (knowledge.get("config") or {}).get("persona", "")
+            knowledge["characters"] = [{
+                "id": char_id,
+                "name": "Dr. Peter Tschauko",
+                "persona": persona,
+                "is_default": True
+            }]
+        
+        logger.info(f"Upgraded v3 knowledge to v4 for track {track_id} (character: {char_id})")
 
     # Save to content-api (single source of truth)
     content_post_id = save_narration_knowledge(track_id, track.name, knowledge)
