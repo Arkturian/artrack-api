@@ -1386,7 +1386,61 @@ async def get_pois_near(
 
     # 5. Sort by distance, limit
     pois_with_distance.sort(key=lambda p: p["distance_m"])
-    pois_with_distance = pois_with_distance[:limit]
+
+    # Split into 3 intelligence layers
+    pois_layer = []          # POI Intelligence: manual waypoints
+    stories_layer = []       # Story Intelligence: story_point waypoints + POIs with stories
+    screen_points_layer = [] # Screen Points: media/video/photo markers
+
+    for p in pois_with_distance:
+        wp_type = p.get("type")
+        if wp_type == "story_point":
+            stories_layer.append(p)
+        elif wp_type == "screen_point":
+            screen_points_layer.append(p)
+        else:
+            pois_layer.append(p)
+            # POIs with story knowledge also count as story intelligence
+            if p.get("stories"):
+                stories_layer.append(p)
+
+    # Apply limit per layer
+    pois_layer = pois_layer[:limit]
+    stories_layer = stories_layer[:limit]
+    screen_points_layer = screen_points_layer[:limit]
+
+    # Build Route Intelligence
+    route_intel = None
+    if user_along is not None and user_route_id is not None:
+        # Compute total length of user's route
+        polyline = route_polylines.get(user_route_id, [])
+        total_length = 0.0
+        for i in range(len(polyline) - 1):
+            total_length += _haversine(polyline[i][0], polyline[i][1],
+                                       polyline[i+1][0], polyline[i+1][1])
+        # Get route name
+        route_obj = next((r for r in routes if r.id == user_route_id), None)
+        # Find next POI ahead on route
+        next_poi = None
+        for p in sorted(pois_with_distance, key=lambda x: x.get("along_meters") or 0):
+            if p.get("along_meters") is not None and p["along_meters"] > user_along:
+                next_poi = {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "distance_m": round(p["along_meters"] - user_along, 1),
+                    "type": p["type"],
+                }
+                break
+        route_intel = {
+            "route_id": user_route_id,
+            "route_name": route_obj.name if route_obj else None,
+            "along_meters": round(user_along, 1),
+            "total_meters": round(total_length, 1),
+            "remaining_meters": round(total_length - user_along, 1),
+            "progress_percent": round((user_along / total_length * 100), 1) if total_length > 0 else None,
+            "lateral_offset_m": user_snap.get("lateral_offset_m") if user_snap else None,
+            "next_poi_ahead": next_poi,
+        }
 
     return {
         "track_id": track_id,
@@ -1400,9 +1454,130 @@ async def get_pois_near(
             "direction": direction,
         },
         "snap": user_snap,
+        "route_intelligence": route_intel,
+        "poi_intelligence": {
+            "count": len(pois_layer),
+            "pois": pois_layer,
+        },
+        "story_intelligence": {
+            "count": len(stories_layer),
+            "story_points": stories_layer,
+        },
+        "screen_points": {
+            "count": len(screen_points_layer),
+            "points": screen_points_layer,
+        },
+        # Backward compatibility
         "total_found": len(pois_with_distance),
-        "pois": pois_with_distance,
+        "pois": pois_with_distance[:limit],
     }
+
+
+@router.get("/{track_id}/pois-near-pretty", response_class=PlainTextResponse)
+async def get_pois_near_pretty(
+    track_id: int,
+    lat: float,
+    lng: float,
+    radius_m: int = 200,
+    limit: int = 5,
+    route_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Pretty-formatted GPS-based POI lookup for AI consumption.
+
+    Returns a compact, structured plain-text format optimized for LLM context.
+    Includes all 3 intelligence layers (Route, POI, Story) and screen points
+    in a token-efficient format that an AI can directly use for inference.
+
+    Use this when you want to pass the result directly into an LLM prompt
+    instead of parsing JSON yourself.
+    """
+    # Reuse the JSON endpoint logic by calling it
+    data = await get_pois_near(
+        track_id=track_id, lat=lat, lng=lng,
+        radius_m=radius_m, limit=limit, route_id=route_id,
+        direction=None, include_text=True,
+        db=db, current_user=current_user
+    )
+
+    lines = []
+    lines.append(f"# {data['track_name']} (track {track_id})")
+    lines.append(f"User position: {lat:.5f}, {lng:.5f} (radius {radius_m}m)")
+    lines.append("")
+
+    # ── Route Intelligence ──
+    ri = data.get("route_intelligence")
+    if ri:
+        lines.append("## Route Intelligence")
+        lines.append(f"- Route: {ri['route_name']} (id {ri['route_id']})")
+        lines.append(f"- Position: {ri['along_meters']/1000:.2f} km / {ri['total_meters']/1000:.2f} km ({ri['progress_percent']}%)")
+        lines.append(f"- Remaining: {ri['remaining_meters']/1000:.2f} km")
+        if ri['lateral_offset_m'] is not None:
+            lines.append(f"- Lateral offset from path: {ri['lateral_offset_m']}m")
+        next_poi = ri.get("next_poi_ahead")
+        if next_poi:
+            lines.append(f"- Next POI ahead: {next_poi['name']} ({next_poi['distance_m']}m)")
+        lines.append("")
+    else:
+        lines.append("## Route Intelligence")
+        lines.append("- User is NOT on any route (off-track)")
+        lines.append("")
+
+    # ── POI Intelligence ──
+    poi_intel = data.get("poi_intelligence", {})
+    pois = poi_intel.get("pois", [])
+    lines.append(f"## POI Intelligence ({poi_intel.get('count', 0)} nearby)")
+    if not pois:
+        lines.append("- No POIs in range")
+    for p in pois:
+        ahead = "→" if p.get("ahead") else ("←" if p.get("ahead") == False else "·")
+        cat = f"{p.get('category')}/{p.get('subcategory')}" if p.get('subcategory') else p.get('category', '')
+        lines.append(f"\n### {ahead} {p['name']} (#{p['id']}, {p['distance_m']}m, {cat})")
+        k = p.get("knowledge", {})
+        if k.get("approaching"):
+            lines.append(f"  approaching: {k['approaching']}")
+        if k.get("at_poi"):
+            lines.append(f"  at_poi: {k['at_poi']}")
+        if p.get("audio_id"):
+            lines.append(f"  audio: storage_id={p['audio_id']}")
+        if p.get("illustration_id"):
+            lines.append(f"  illustration: storage_id={p['illustration_id']}")
+    lines.append("")
+
+    # ── Story Intelligence ──
+    story_intel = data.get("story_intelligence", {})
+    story_pts = story_intel.get("story_points", [])
+    lines.append(f"## Story Intelligence ({story_intel.get('count', 0)} story elements)")
+    if not story_pts:
+        lines.append("- No story points in range")
+    for sp in story_pts:
+        ahead = "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
+        lines.append(f"\n### {ahead} {sp['name']} (#{sp['id']}, {sp['distance_m']}m)")
+        stories = sp.get("stories") or []
+        for s in stories:
+            char = s.get("character", "?")
+            scene = s.get("scene", "?")
+            sid = s.get("story_id", "?")
+            lines.append(f"  story={sid} scene={scene} character={char}")
+            if s.get("text"):
+                # Replace dialog separator | with newlines for readability
+                txt = s["text"].replace(" | ", "\n    ")
+                lines.append(f"    {txt}")
+    lines.append("")
+
+    # ── Screen Points ──
+    screen_pts = data.get("screen_points", {})
+    sp_list = screen_pts.get("points", [])
+    if sp_list:
+        lines.append(f"## Screen Points / Media ({screen_pts.get('count', 0)})")
+        for sp in sp_list:
+            ahead = "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
+            lines.append(f"- {ahead} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, type={sp.get('type')})")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 @router.get("/{track_id}/segments-pretty")
