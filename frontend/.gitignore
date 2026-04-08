@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-tsc/
+.vite/
+*.log
+.DS_Store
+node_modules/
+dist/
+dist-tsc/
+*.log
+.env
+.env.local

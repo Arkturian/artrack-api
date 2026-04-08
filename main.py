@@ -33,6 +33,7 @@ from artrack.routes import (
     guide_routes,
     categories_routes,
     knowledge_routes,
+    gps_tracker_routes,
 )
 
 # Create database tables
@@ -66,6 +67,20 @@ app.include_router(routes_routes.router, prefix="/tracks", tags=["Routes"])
 app.include_router(guide_routes.router, prefix="/guides", tags=["Audio Guides"])
 app.include_router(categories_routes.router, prefix="/categories", tags=["Categories"])
 app.include_router(knowledge_routes.router, prefix="/tracks", tags=["Route Knowledge"])
+app.include_router(gps_tracker_routes.router, prefix="/api", tags=["GPS Tracker Frontend"])
+
+# Mount the Vite-built frontend assets for the gps-tracker audio-guide.
+# This is the counterpart to the gps_tracker_routes endpoint — the HTML
+# shell is served dynamically (with injected config), while the static
+# JS/CSS assets are served from this mount. Files get content-hashed
+# filenames by Vite so they can be cached forever.
+FRONTEND_ASSETS_DIR = Path(__file__).parent / "frontend" / "dist" / "assets"
+if FRONTEND_ASSETS_DIR.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND_ASSETS_DIR)),
+        name="gps-tracker-assets",
+    )
 
 @app.get("/")
 def root():

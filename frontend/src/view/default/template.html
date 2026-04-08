@@ -1,0 +1,130 @@
+<h2 id="appTitle">GPS Tracker</h2>
+
+<div id="map"></div>
+
+<!-- Map legend: static color key for the marker types the MapRenderer draws.
+     Keep in sync with MapRenderer styling + the gpsFocusPulse animation. -->
+<div class="map-legend" aria-label="Karten-Legende">
+  <span><i class="leg-dot leg-user"></i>Du</span>
+  <span><i class="leg-line leg-trail"></i>Trail</span>
+  <span><i class="leg-dot leg-poi"></i>POIs</span>
+  <span><i class="leg-dot leg-dest"></i>Ziel</span>
+  <span><i class="leg-dot leg-focus"></i>Thema</span>
+</div>
+
+<!-- Topic card: visual context rendered from `topic` field in Guide JSON response.
+     Hidden by default, shown when an IACP response includes a topic. -->
+<div id="topicCard" class="topic-card" style="display:none">
+  <div id="topicImgWrap" class="topic-image-wrap" style="display:none">
+    <img id="topicImg" class="topic-image" alt="" />
+  </div>
+  <div class="topic-body">
+    <div class="topic-title" id="topicTitle">-</div>
+    <div class="topic-subtitle" id="topicSubtitle"></div>
+    <div class="topic-extract" id="topicExtract" style="display:none"></div>
+    <div class="topic-tags" id="topicTags"></div>
+    <div class="topic-actions" id="topicActions"></div>
+  </div>
+</div>
+
+<div id="ytWrap" style="background:#000;border-radius:12px;overflow:hidden;margin:10px 0">
+  <div id="ytPlayer" style="width:100%;height:120px"></div>
+  <div style="padding:6px 10px;font-size:11px;color:#9ece6a;display:flex;justify-content:space-between;align-items:center">
+    <span id="nowPlaying">♪ Warte auf Song-Empfehlung</span>
+    <button id="ytNextBtn" style="background:#7aa2f7;color:#1a1b26;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:700;cursor:pointer;width:auto;margin:0">Next ⏭</button>
+  </div>
+  <div id="songQueue" style="padding:6px 10px;font-size:10px;color:#565f89;max-height:60px;overflow:auto"></div>
+</div>
+
+<div class="status">
+  <div class="label">Position</div>
+  <div class="value" id="pos">Waiting...</div>
+  <div class="small" id="street">-</div>
+  <div class="small" id="destInfo" style="display:none;color:#9ece6a;margin-top:4px"></div>
+</div>
+
+<div style="display:flex;gap:10px">
+  <div class="status" style="flex:1;text-align:center">
+    <div id="arrow" class="arrow-icon">⬆</div>
+    <div class="value" id="compass">-</div>
+    <div class="small" id="speed">-</div>
+  </div>
+  <div class="status" style="flex:1">
+    <div class="label">Status</div>
+    <div class="value" id="status">Idle</div>
+    <div class="small" id="count">0 updates sent</div>
+  </div>
+</div>
+
+<div class="status">
+  <div class="label">Mode</div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+    <button class="mode-btn" data-mode="drift">🪄 Drift</button>
+    <button class="mode-btn" data-mode="culture">🏛 Culture</button>
+    <button class="mode-btn" data-mode="night">🌃 Night</button>
+    <button class="mode-btn" data-mode="scenic">🌳 Scenic</button>
+  </div>
+</div>
+
+<div class="status">
+  <div class="label">🗺 Special Track (Curated Audio-Guide)</div>
+  <select id="specialTrackSelect" style="width:100%;background:#1a1b26;color:#c0caf5;border:1px solid #414868;border-radius:8px;padding:10px;font-size:14px;font-weight:600;margin-top:6px;cursor:pointer">
+    <option value="0">Aus (Generic World Guide)</option>
+    <option value="30">🏔 Tscheppaschlucht — Dr. Tschauko</option>
+  </select>
+</div>
+
+<div style="display:flex;gap:10px;margin:8px 0">
+  <div style="flex:1">
+    <span class="label">⏱ Budget (0 = ∞)</span>
+    <input type="number" id="rideBudget" value="0" min="0" max="240" style="width:100%;background:#1a1b26;color:#9ece6a;border:1px solid #414868;border-radius:8px;padding:8px;font-size:18px;font-weight:700;text-align:center">
+  </div>
+  <div style="flex:1">
+    <span class="label">Verbleibend</span>
+    <div id="budgetRemain" class="value" style="font-size:24px;color:#7aa2f7;text-align:center;padding-top:6px">∞</div>
+  </div>
+</div>
+
+<div style="display:flex;align-items:center;gap:10px;margin:8px 0">
+  <span class="label">Intervall:</span>
+  <input type="range" id="intervalSlider" min="10" max="120" value="60" step="5" style="flex:1">
+  <span class="value" id="intervalLabel" style="font-size:14px;min-width:35px">60s</span>
+</div>
+
+<button class="start" id="startBtn">Start Tracking</button>
+<button class="stop" id="stopBtn" style="display:none">Stop</button>
+
+<div style="display:flex;gap:10px;margin:8px 0">
+  <button id="driftBtn" class="action-btn-drift" style="flex:1;padding:14px;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;margin:0">
+    🪄 Drift Me
+  </button>
+  <button id="micBtn" class="action-btn-mic" style="flex:1;padding:14px;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;margin:0">
+    🎤 Voice
+  </button>
+</div>
+
+<div style="display:flex;gap:10px;margin:8px 0">
+  <button id="moreBtn" class="action-btn-more" style="flex:1;padding:12px;border:none;border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;margin:0">
+    ✨ More Like This
+  </button>
+  <button id="pauseBtn" class="action-btn-pause" style="flex:1;padding:12px;border:none;border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;margin:0">
+    ⏸ Pause Voice
+  </button>
+</div>
+
+<div style="display:flex;gap:10px;margin:8px 0">
+  <button id="rebootBtn" style="flex:1;padding:12px;border:none;border-radius:12px;font-size:14px;font-weight:700;cursor:pointer;margin:0;background:#7a829e;color:#1a1b26">
+    🔄 Reboot Guide
+  </button>
+</div>
+
+<div id="vibeWrap" style="text-align:center;margin:8px 0;display:none">
+  <span class="vibe-pill" id="vibeTag">vibing</span>
+</div>
+
+<div id="lastResponse" style="display:none" class="status">
+  <div class="label">Guide sagt:</div>
+  <div class="value" id="responseText" style="font-size:14px;line-height:1.5"></div>
+</div>
+
+<div id="log"></div>
