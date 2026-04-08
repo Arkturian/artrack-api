@@ -1175,6 +1175,198 @@ async def get_all_pois_pretty(
     }
 
 
+@router.get("/{track_id}/pois-near")
+async def get_pois_near(
+    track_id: int,
+    lat: float,
+    lng: float,
+    radius_m: int = 200,
+    limit: int = 10,
+    route_id: Optional[int] = None,
+    direction: Optional[str] = None,
+    include_text: bool = True,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    GPS-based POI lookup with optional route-snapping.
+
+    Returns POIs near the given GPS position, sorted by distance.
+    Includes route snapping (snapped position + along_meters) and rich
+    metadata (knowledge text, audio_id, illustration_id).
+
+    Designed for AI audio guides that need fast, low-cost POI lookups
+    without burning tokens on filtering.
+
+    Parameters:
+    - lat, lng: User's current GPS position
+    - radius_m: Max distance in meters (default 200)
+    - limit: Max number of POIs to return (default 10)
+    - route_id: Optional - constrain to a specific route
+    - direction: Optional - "ahead" (only POIs ahead on route) | "behind" |
+      None (all directions). Requires route_id to work.
+    - include_text: Include knowledge text (approaching/at_poi) in response
+                    (default true; set false for smaller payload)
+
+    Returns:
+    {
+      track_id, query: {lat, lng, radius_m},
+      snap: {snapped_lat, snapped_lng, along_meters, route_id, lateral_offset_m} | null,
+      pois: [{id, name, type, lat, lng, distance_m, along_meters, ahead,
+              category, route_id, knowledge: {approaching, at_poi}, audio_id,
+              illustration_id}]
+    }
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # 1. Build polylines per route (for snapping)
+    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    route_polylines = {}
+    for route in routes:
+        gps_points = db.query(Waypoint).filter(
+            Waypoint.track_id == track_id,
+            Waypoint.route_id == route.id,
+            Waypoint.waypoint_type == "gps_track"
+        ).order_by(Waypoint.recorded_at.asc()).all()
+        if len(gps_points) >= 2:
+            route_polylines[route.id] = [(p.latitude, p.longitude) for p in gps_points]
+
+    # 2. Snap user position to closest route (or constrained route)
+    user_snap = None
+    user_along = None
+    user_route_id = route_id
+    snap_candidates = []
+    for r_id, polyline in route_polylines.items():
+        if route_id is not None and r_id != route_id:
+            continue
+        dist, along, snap_lat, snap_lon = _closest_point_on_polyline(polyline, lat, lng)
+        snap_candidates.append((r_id, dist, along, snap_lat, snap_lon))
+
+    if snap_candidates:
+        # Pick closest snap
+        snap_candidates.sort(key=lambda x: x[1])
+        best = snap_candidates[0]
+        user_route_id = best[0]
+        user_snap = {
+            "snapped_lat": best[3],
+            "snapped_lng": best[4],
+            "along_meters": round(best[2], 1),
+            "route_id": best[0],
+            "lateral_offset_m": round(best[1], 1),
+        }
+        user_along = best[2]
+
+    # 3. Get all POIs (manual waypoints + story_points etc., not gps_track)
+    all_waypoints = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.waypoint_type != "gps_track"
+    ).all()
+
+    # 4. For each POI: calculate distance, snap to route, filter
+    pois_with_distance = []
+    for wp in all_waypoints:
+        meta = wp.metadata_json or {}
+
+        # Skip segment markers
+        if meta.get("segment"):
+            continue
+
+        # Direct GPS distance from user to POI
+        dist_to_user = _haversine(lat, lng, wp.latitude, wp.longitude)
+        if dist_to_user > radius_m:
+            continue
+
+        # Find POI's along_meters on the user's route (for direction filter)
+        poi_along = None
+        if user_route_id and user_route_id in route_polylines:
+            polyline = route_polylines[user_route_id]
+            _, poi_along_calc, _, _ = _closest_point_on_polyline(polyline, wp.latitude, wp.longitude)
+            poi_along = poi_along_calc
+
+        # Direction filter (requires user_along + poi_along)
+        ahead = None
+        if poi_along is not None and user_along is not None:
+            ahead = poi_along >= user_along
+            if direction == "ahead" and not ahead:
+                continue
+            if direction == "behind" and ahead:
+                continue
+
+        # Build POI dict
+        poi_name = meta.get("title") or wp.user_description or f"POI {wp.id}"
+        category = meta.get("category")
+        knowledge = meta.get("knowledge") or {}
+
+        poi_data = {
+            "id": wp.id,
+            "name": poi_name[:100] if poi_name else None,
+            "type": wp.waypoint_type,
+            "lat": wp.latitude,
+            "lng": wp.longitude,
+            "distance_m": round(dist_to_user, 1),
+            "along_meters": round(poi_along, 1) if poi_along is not None else None,
+            "ahead": ahead,
+            "category": category,
+            "subcategory": meta.get("subcategory"),
+            "route_id": user_route_id,
+        }
+
+        if include_text:
+            # Knowledge texts (approaching + at_poi)
+            approaching = knowledge.get("approaching", {})
+            at_poi = knowledge.get("at_poi", {})
+            poi_data["knowledge"] = {
+                "approaching": approaching.get("text") if isinstance(approaching, dict) else None,
+                "at_poi": at_poi.get("text") if isinstance(at_poi, dict) else None,
+            }
+            poi_data["radius_m"] = meta.get("radiusMeters")
+
+            # Audio + illustration IDs (from assets array if available)
+            assets = meta.get("assets") or []
+            audio_id = None
+            illustration_id = None
+            icon_id = None
+            for a in assets:
+                if isinstance(a, dict):
+                    role = a.get("role")
+                    aid = a.get("id")
+                    if role == "audio" and not audio_id:
+                        audio_id = aid
+                    elif role == "illustration" and not illustration_id:
+                        illustration_id = aid
+                    elif role == "icon" and not icon_id:
+                        icon_id = aid
+            poi_data["audio_id"] = audio_id
+            poi_data["illustration_id"] = illustration_id
+            poi_data["icon_id"] = icon_id
+
+        pois_with_distance.append(poi_data)
+
+    # 5. Sort by distance, limit
+    pois_with_distance.sort(key=lambda p: p["distance_m"])
+    pois_with_distance = pois_with_distance[:limit]
+
+    return {
+        "track_id": track_id,
+        "track_name": track.name,
+        "query": {
+            "lat": lat,
+            "lng": lng,
+            "radius_m": radius_m,
+            "limit": limit,
+            "route_id": route_id,
+            "direction": direction,
+        },
+        "snap": user_snap,
+        "total_found": len(pois_with_distance),
+        "pois": pois_with_distance,
+    }
+
+
 @router.get("/{track_id}/segments-pretty")
 async def get_all_segments_pretty(
     track_id: int,

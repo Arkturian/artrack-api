@@ -15,7 +15,7 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 CONTENT_API_BASE = settings.CONTENT_API_BASE
-DOC_TYPE = "artrack_narration"
+DOC_TYPE = "audio_guide"
 AUTHOR_ID = "artrack-system"
 AUTHOR_NAME = "ARTrack Knowledge System"
 PARTNER_ID = "artrack"
