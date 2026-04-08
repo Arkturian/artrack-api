@@ -1250,15 +1250,21 @@ async def get_pois_near(
         # Pick closest snap
         snap_candidates.sort(key=lambda x: x[1])
         best = snap_candidates[0]
-        user_route_id = best[0]
-        user_snap = {
-            "snapped_lat": best[3],
-            "snapped_lng": best[4],
-            "along_meters": round(best[2], 1),
-            "route_id": best[0],
-            "lateral_offset_m": round(best[1], 1),
-        }
-        user_along = best[2]
+        # Cutoff: if user is more than 400m off any route, don't snap (user is not on the track)
+        if best[1] <= 400:
+            user_route_id = best[0]
+            user_snap = {
+                "snapped_lat": best[3],
+                "snapped_lng": best[4],
+                "along_meters": round(best[2], 1),
+                "route_id": best[0],
+                "lateral_offset_m": round(best[1], 1),
+            }
+            user_along = best[2]
+        else:
+            # User is too far from any route — return null snap
+            user_route_id = None
+            user_along = None
 
     # 3. Get all POIs (manual waypoints + story_points etc., not gps_track)
     all_waypoints = db.query(Waypoint).filter(
@@ -1324,6 +1330,38 @@ async def get_pois_near(
                 "at_poi": at_poi.get("text") if isinstance(at_poi, dict) else None,
             }
             poi_data["radius_m"] = meta.get("radiusMeters")
+
+            # Stories at this POI (knowledge.story.{story_id} from POIs,
+            # OR direct fields on story_point waypoints)
+            stories = []
+            story_dict = knowledge.get("story") if isinstance(knowledge, dict) else None
+            if isinstance(story_dict, dict):
+                for story_id, scene_data in story_dict.items():
+                    if isinstance(scene_data, dict):
+                        stories.append({
+                            "story_id": story_id,
+                            "scene": scene_data.get("scene"),
+                            "role": scene_data.get("role"),
+                            "trigger": scene_data.get("trigger"),
+                            "trigger_radius": scene_data.get("trigger_radius"),
+                            "character": scene_data.get("character"),
+                            "text": scene_data.get("text"),
+                        })
+            # story_point waypoints have story info as direct metadata fields
+            if wp.waypoint_type == "story_point" and meta.get("story_id"):
+                stories.append({
+                    "story_id": meta.get("story_id"),
+                    "scene": meta.get("scene_order"),
+                    "role": "story_point",
+                    "character": meta.get("character"),
+                    "along_meters_planned": meta.get("along_meters"),
+                    "text": (knowledge.get("at_poi") or {}).get("text") if isinstance(knowledge, dict) else None,
+                })
+            poi_data["stories"] = stories if stories else None
+
+            # Long-form description from waypoint
+            if wp.user_description:
+                poi_data["description"] = wp.user_description[:2000]
 
             # Audio + illustration IDs (from assets array if available)
             assets = meta.get("assets") or []
