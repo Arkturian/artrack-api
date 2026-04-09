@@ -66,11 +66,14 @@ jobs:
 
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: MAPBOX_ACCESS_TOKEN
           script: |
             set -e
 
@@ -156,6 +159,24 @@ jobs:
                 }
               done
               echo "✅ Custom migrations completed"
+            fi
+
+            # Write systemd drop-in with runtime env vars (mapbox token etc).
+            # Drop-ins under /etc/systemd/system/<svc>.service.d/ are merged
+            # into the main unit file by systemd without needing to touch it.
+            if [ -n "$MAPBOX_ACCESS_TOKEN" ]; then
+              echo "Writing systemd drop-in with MAPBOX_ACCESS_TOKEN..."
+              mkdir -p /etc/systemd/system/artrack-api.service.d
+              cat > /etc/systemd/system/artrack-api.service.d/env.conf <<EOF
+            [Service]
+            Environment="MAPBOX_ACCESS_TOKEN=$MAPBOX_ACCESS_TOKEN"
+            Environment="CLOUD_API_BOOTSTRAP=https://cloud.arkserver.arkturian.com"
+            EOF
+              chmod 644 /etc/systemd/system/artrack-api.service.d/env.conf
+              systemctl daemon-reload
+              echo "✅ systemd drop-in written"
+            else
+              echo "⚠️  MAPBOX_ACCESS_TOKEN not set — skipping drop-in write"
             fi
 
             # Restart service
