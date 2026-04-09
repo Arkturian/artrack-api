@@ -24,8 +24,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run build
-        run: echo 'No build needed for FastAPI'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Clone audio-guide library as sibling
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          git clone https://x-access-token:$GH_TOKEN@github.com/apopovic77/audio-guide.git ../audio-guide
+
+      - name: Build audio-guide library
+        run: |
+          cd ../audio-guide
+          npm install
+          npm run build
+
+      - name: Typecheck + build artrack-api frontend
+        run: |
+          cd frontend
+          npm install
+          npm run typecheck
+          npm run build
 
       - name: Test import
         run: python -c "import fastapi; print('FastAPI installed successfully')"

@@ -23,8 +23,46 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build application
-        run: echo 'No build needed for FastAPI'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Clone audio-guide library as sibling
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # artrack-api/frontend/package.json depends on file:../../audio-guide
+          # So the library must live as a sibling of the artrack-api workspace.
+          git clone https://x-access-token:$GH_TOKEN@github.com/apopovic77/audio-guide.git ../audio-guide
+          echo "audio-guide cloned. Sibling layout:"
+          ls -la ..
+
+      - name: Build audio-guide library
+        run: |
+          cd ../audio-guide
+          npm install
+          npm run build
+          ls -la dist/ | head -5
+
+      - name: Build artrack-api frontend
+        run: |
+          cd frontend
+          npm install
+          npm run build
+          echo "frontend/dist contents:"
+          ls -la dist/
+
+      - name: Upload frontend/dist to server
+        uses: easingthemes/ssh-deploy@v5.1.0
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.DEPLOY_HOST }}
+          REMOTE_USER: ${{ secrets.DEPLOY_USER }}
+          REMOTE_PORT: ${{ secrets.DEPLOY_PORT || 22 }}
+          ARGS: "-rlgoDzvc --delete"
+          SOURCE: "frontend/dist/"
+          TARGET: "/var/www/api-artrack.arkturian.com/frontend/dist/"
 
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
@@ -72,6 +110,8 @@ jobs:
               --exclude='*.pyc' \
               --exclude='.env' \
               --exclude='venv' \
+              --exclude='frontend/dist' \
+              --exclude='frontend/node_modules' \
               "$REPO_PATH/" "$DEPLOY_PATH/"
 
             # Install dependencies in deployment directory
