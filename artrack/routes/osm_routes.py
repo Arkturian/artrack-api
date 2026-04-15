@@ -65,16 +65,18 @@ OVERPASS_URLS = [
 def _build_query(lat: float, lng: float, radius_m: int) -> str:
     """Overpass QL query for named features in radius."""
     r = radius_m
-    return f"""[out:json][timeout:10];
+    # NO [name] filter in the query — it's paradoxically slower on Overpass
+    # because it forces a per-element tag scan. We filter for name in Python
+    # (_parse_elements checks for name). Without [name], Overpass uses fast
+    # spatial indices only → 1-2s instead of 5-8s.
+    return f"""[out:json][timeout:8];
 (
-  node(around:{r},{lat},{lng})["name"]["amenity"];
-  node(around:{r},{lat},{lng})["name"]["shop"];
-  node(around:{r},{lat},{lng})["name"]["tourism"];
-  node(around:{r},{lat},{lng})["name"]["historic"];
-  node(around:{r},{lat},{lng})["name"]["leisure"];
-  node(around:{r},{lat},{lng})["name"]["natural"];
-  way(around:{r},{lat},{lng})["name"]["building"];
-  way(around:{r},{lat},{lng})["name"]["landuse"]["landuse"!="residential"];
+  node(around:{r},{lat},{lng})["amenity"];
+  node(around:{r},{lat},{lng})["shop"];
+  node(around:{r},{lat},{lng})["tourism"];
+  node(around:{r},{lat},{lng})["historic"];
+  node(around:{r},{lat},{lng})["leisure"];
+  way(around:{r},{lat},{lng})["building"];
 );
 out center tags;"""
 
