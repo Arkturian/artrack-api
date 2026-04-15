@@ -26,7 +26,7 @@ PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 # ── SQLite Cache ──────────────────────────────────────────────────
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "places_cache.db")
-_CACHE_TTL = 86400  # 24 hours (was 1h with in-memory — persistent cache can be longer)
+_CACHE_TTL = 2592000  # 30 days
 _RADIUS_BUCKETS = [50, 100, 200, 500, 1000, 2000]
 
 
@@ -76,7 +76,7 @@ def _cache_set(key: str, data: dict):
         # Cleanup old entries (keep max 2000)
         conn.execute("""
             DELETE FROM places_cache WHERE key NOT IN (
-                SELECT key FROM places_cache ORDER BY created_at DESC LIMIT 2000
+                SELECT key FROM places_cache ORDER BY created_at DESC LIMIT 1000000
             )
         """)
         conn.commit()
