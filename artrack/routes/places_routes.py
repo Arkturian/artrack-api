@@ -172,7 +172,7 @@ def _parse_results(lat: float, lng: float, results: list) -> list[dict]:
 async def places_nearby(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
-    radius_m: int = Query(200, ge=10, le=2000, description="Search radius (max 2000m)"),
+    radius_m: int = Query(200, ge=5, le=2000, description="Search radius (max 2000m)"),
     type: Optional[str] = Query(None, description="Filter by Google Place type"),
 ):
     """
