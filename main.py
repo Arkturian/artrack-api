@@ -33,6 +33,7 @@ from artrack.routes import (
     guide_routes,
     categories_routes,
     knowledge_routes,
+    osm_routes,
 )
 
 # Create database tables
@@ -66,6 +67,7 @@ app.include_router(routes_routes.router, prefix="/tracks", tags=["Routes"])
 app.include_router(guide_routes.router, prefix="/guides", tags=["Audio Guides"])
 app.include_router(categories_routes.router, prefix="/categories", tags=["Categories"])
 app.include_router(knowledge_routes.router, prefix="/tracks", tags=["Route Knowledge"])
+app.include_router(osm_routes.router, prefix="/osm", tags=["OpenStreetMap"])
 
 @app.get("/")
 def root():
