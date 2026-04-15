@@ -55,7 +55,11 @@ def _evict_oldest():
 
 # ── Overpass Query ────────────────────────────────────────────────
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 
 
 def _build_query(lat: float, lng: float, radius_m: int) -> str:
@@ -173,23 +177,27 @@ async def osm_nearby(
 
     _last_overpass_request = time.time()
 
-    # Query Overpass
+    # Query Overpass — try multiple mirrors with failover
     query = _build_query(lat, lng, radius_m)
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.post(
-                OVERPASS_URL,
-                data={"data": query},
-                headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Overpass API timeout")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Overpass API error: {e.response.status_code}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Overpass query failed: {str(e)}")
+    data = None
+    last_error = ""
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for url in OVERPASS_URLS:
+            try:
+                resp = await client.post(
+                    url,
+                    data={"data": query},
+                    headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break  # success
+            except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
+                last_error = f"{url}: {e}"
+                continue  # try next mirror
+
+    if data is None:
+        raise HTTPException(status_code=502, detail=f"All Overpass mirrors failed. Last: {last_error}")
 
     # Parse + cache
     features = _parse_elements(lat, lng, data.get("elements", []))
