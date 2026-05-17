@@ -68,7 +68,17 @@ class Track(Base):
     # Assets for the whole track (e.g., guide audio, images)
     storage_object_ids = Column(JSON, default=list)
     storage_collection = Column(JSON, default=dict)
-    
+
+    # Bounding circle — derived attribute, maintained by services/track_bbox.py
+    # after any waypoint insert/delete/cleanup. Used as a cheap broad-phase
+    # filter in GET /tracks/nearby so we don't snap-to-polyline every track
+    # on every GPS tick. NULL until first recompute; the /nearby endpoint
+    # treats NULL as "not in this circle" and the read-side falls back to
+    # a lazy recompute.
+    bbox_center_lat = Column(Float, nullable=True)
+    bbox_center_lon = Column(Float, nullable=True)
+    bbox_radius_m = Column(Float, nullable=True)
+
     # Relationships
     waypoints = relationship("Waypoint", back_populates="track")
     collaborators = relationship("TrackCollaborator", back_populates="track")

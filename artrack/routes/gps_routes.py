@@ -148,7 +148,14 @@ async def create_gps_point(
     db.add(waypoint)
     db.commit()
     db.refresh(waypoint)
-    
+
+    # Refresh derived bounding-circle (broad-phase index for /tracks/nearby).
+    try:
+        from ..services.track_bbox import recompute_bbox
+        recompute_bbox(db, track_id)
+    except Exception:
+        pass  # never block the GPS write on bbox maintenance
+
     response = GPSPointResponse(
         id=waypoint.id,
         trackId=waypoint.track_id,
@@ -162,7 +169,7 @@ async def create_gps_point(
         isFromKalmanFilter=gps_point.isFromKalmanFilter,
         createdAt=waypoint.created_at
     )
-    
+
     return response
 
 @router.post("/{track_id}/gps-points/batch", response_model=GPSPointBatchResponse)
@@ -259,12 +266,21 @@ async def create_gps_point_batch(
             db.rollback()
             print(f"GPS batch insert failed for track {track_id}: {e}")
             raise HTTPException(status_code=500, detail="Batch insert failed")
-    
+
     # Calculate processing time
     processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-    
+
     # Schedule background track statistics update
     background_tasks.add_task(update_track_statistics, track_id, db)
+
+    # Refresh derived bounding-circle once per batch (not per point) so
+    # /tracks/nearby stays in sync without exploding insert cost.
+    if waypoints_to_add:
+        try:
+            from ..services.track_bbox import recompute_bbox
+            recompute_bbox(db, track_id)
+        except Exception:
+            pass
     
     response = GPSPointBatchResponse(
         batchId=batch.batchId,
@@ -481,7 +497,16 @@ async def clear_gps_points(
         # Delete all GPS track points
         deleted_count = base_q.delete()
         db.commit()
-    
+
+    # Refresh derived bounding-circle after deletion. If the track is now
+    # empty, recompute_bbox clears the three fields back to NULL.
+    if deleted_count:
+        try:
+            from ..services.track_bbox import recompute_bbox
+            recompute_bbox(db, track_id)
+        except Exception:
+            pass
+
     return {
         "message": f"Cleared {deleted_count} GPS points from track {track_id}",
         "deleted_count": deleted_count
@@ -543,6 +568,14 @@ async def cleanup_orphan_gps_points(
     except Exception:
         db.rollback()
         raise
+
+    # Refresh derived bounding-circle if cleanup actually deleted anything.
+    if deleted:
+        try:
+            from ..services.track_bbox import recompute_bbox
+            recompute_bbox(db, track_id)
+        except Exception:
+            pass
 
     return GPSCleanupResult(deleted_orphans=deleted, normalized=normalized)
 

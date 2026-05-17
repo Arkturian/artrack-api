@@ -167,6 +167,16 @@ async def connect_db():
                     conn.execute(text("ALTER TABLE tracks ADD COLUMN storage_object_ids JSON"))
                 if "storage_collection" not in tcols:
                     conn.execute(text("ALTER TABLE tracks ADD COLUMN storage_collection JSON"))
+                # Bounding-circle derived attributes (see services/track_bbox.py).
+                # Used by GET /tracks/nearby as a cheap broad-phase spatial filter
+                # before the more expensive snap-to-polyline. NULL until first
+                # waypoint write or admin recompute.
+                if "bbox_center_lat" not in tcols:
+                    conn.execute(text("ALTER TABLE tracks ADD COLUMN bbox_center_lat FLOAT"))
+                if "bbox_center_lon" not in tcols:
+                    conn.execute(text("ALTER TABLE tracks ADD COLUMN bbox_center_lon FLOAT"))
+                if "bbox_radius_m" not in tcols:
+                    conn.execute(text("ALTER TABLE tracks ADD COLUMN bbox_radius_m FLOAT"))
                 if "ai_category" not in scols:
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN ai_category VARCHAR"))
                 if "ai_danger_potential" not in scols:
