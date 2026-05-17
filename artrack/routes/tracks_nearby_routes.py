@@ -62,16 +62,22 @@ def tracks_nearby(
     lat: float = Query(..., description="Query latitude"),
     lon: float = Query(..., description="Query longitude"),
     max_distance_m: float = Query(200.0, description="Filter: only tracks within this snap distance"),
-    visibility: str = Query("public", description="public|all — 'all' includes private tracks (debug)"),
+    include_ineligible: bool = Query(False, description="Debug: include tracks with auto_detect_eligible=false"),
     db: Session = Depends(get_db),
 ):
-    """Detect tracks near a GPS position via broad+narrow spatial filter."""
+    """Detect tracks near a GPS position via broad+narrow spatial filter.
+
+    Only tracks with `auto_detect_eligible=true` are returned by default.
+    This is the explicit opt-in flag the track owner sets in the artrack
+    UI; visibility (public/private) is unrelated. The include_ineligible
+    flag is a debug switch — production traffic should leave it false.
+    """
     import time
     start = time.monotonic()
 
     base_q = db.query(Track)
-    if visibility == "public":
-        base_q = base_q.filter(Track.visibility == "public")
+    if not include_ineligible:
+        base_q = base_q.filter(Track.auto_detect_eligible.is_(True))
     tracks = base_q.all()
 
     candidates: list[Track] = []

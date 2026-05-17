@@ -79,6 +79,13 @@ class Track(Base):
     bbox_center_lon = Column(Float, nullable=True)
     bbox_radius_m = Column(Float, nullable=True)
 
+    # Wanderlaut auto-detect eligibility — opt-in flag set by the track
+    # owner in the artrack UI. Decoupled from `visibility` so a track can
+    # stay private (creator-only access via X-API-KEY) while still being
+    # eligible to auto-activate the audio-guide when a user walks near it.
+    # GET /tracks/nearby filters on this flag exclusively.
+    auto_detect_eligible = Column(Boolean, default=False, nullable=False)
+
     # Relationships
     waypoints = relationship("Waypoint", back_populates="track")
     collaborators = relationship("TrackCollaborator", back_populates="track")

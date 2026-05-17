@@ -177,6 +177,9 @@ async def connect_db():
                     conn.execute(text("ALTER TABLE tracks ADD COLUMN bbox_center_lon FLOAT"))
                 if "bbox_radius_m" not in tcols:
                     conn.execute(text("ALTER TABLE tracks ADD COLUMN bbox_radius_m FLOAT"))
+                # Wanderlaut auto-detect opt-in flag — see Track model docstring
+                if "auto_detect_eligible" not in tcols:
+                    conn.execute(text("ALTER TABLE tracks ADD COLUMN auto_detect_eligible BOOLEAN DEFAULT 0 NOT NULL"))
                 if "ai_category" not in scols:
                     conn.execute(text("ALTER TABLE storage_objects ADD COLUMN ai_category VARCHAR"))
                 if "ai_danger_potential" not in scols:
