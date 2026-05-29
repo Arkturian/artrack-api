@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Tuple
 from datetime import datetime
 import math
+import time
 
 from ..database import get_db
 from ..auth import get_current_user
@@ -138,6 +139,50 @@ def _closest_point_on_polyline(poly: List[Tuple[float, float]], lat: float, lon:
 
     min_dist, best_along, snap_lat, snap_lon = min(candidates, key=lambda x: x[0])
     return (min_dist, best_along, snap_lat, snap_lon)
+
+
+# Lateral distance (m) within which the user is considered "on" the route path.
+ON_TRACK_THRESHOLD_M = 25.0
+
+# In-process cache for per-route polylines, keyed by track_id.
+# Route geometry (gps_track waypoints) changes rarely, but a guide client polls
+# this every few meters — rebuilding the polyline from hundreds of rows on every
+# request is the one real hot path. TTL keeps it fresh enough for live editing.
+_POLYLINE_CACHE: dict = {}
+_POLYLINE_CACHE_TTL = 300.0  # seconds
+
+
+def _get_track_polylines(db: Session, track_id: int) -> dict:
+    """
+    Return {route_id: [(lat, lon), ...]} built from gps_track waypoints
+    (ordered by recorded_at), cached in-process per track for _POLYLINE_CACHE_TTL.
+
+    Single grouped query instead of one-per-route. Only routes with >= 2 points
+    are included (a polyline needs at least one segment).
+    """
+    now = time.monotonic()
+    cached = _POLYLINE_CACHE.get(track_id)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    gps_points = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.waypoint_type == "gps_track",
+        Waypoint.route_id.isnot(None),
+    ).order_by(Waypoint.route_id.asc(), Waypoint.recorded_at.asc()).all()
+
+    grouped: dict = {}
+    for p in gps_points:
+        grouped.setdefault(p.route_id, []).append((p.latitude, p.longitude))
+    polylines = {rid: pts for rid, pts in grouped.items() if len(pts) >= 2}
+
+    _POLYLINE_CACHE[track_id] = (now + _POLYLINE_CACHE_TTL, polylines)
+    return polylines
+
+
+def _invalidate_polyline_cache(track_id: int) -> None:
+    """Drop the cached polylines for a track (call after route geometry edits)."""
+    _POLYLINE_CACHE.pop(track_id, None)
 
 
 def _waypoint_belongs_to_route(wp: Waypoint, route_id: int, track_id: int, db: Session, track: Track, max_snap_distance: float = 50.0) -> bool:
@@ -1184,6 +1229,7 @@ async def get_pois_near(
     limit: int = 10,
     route_id: Optional[int] = None,
     direction: Optional[str] = None,
+    ahead_only: bool = False,
     include_text: bool = True,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
@@ -1223,17 +1269,9 @@ async def get_pois_near(
     if track.created_by != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # 1. Build polylines per route (for snapping)
+    # 1. Build polylines per route (for snapping) — cached in-process per track.
     routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
-    route_polylines = {}
-    for route in routes:
-        gps_points = db.query(Waypoint).filter(
-            Waypoint.track_id == track_id,
-            Waypoint.route_id == route.id,
-            Waypoint.waypoint_type == "gps_track"
-        ).order_by(Waypoint.recorded_at.asc()).all()
-        if len(gps_points) >= 2:
-            route_polylines[route.id] = [(p.latitude, p.longitude) for p in gps_points]
+    route_polylines = _get_track_polylines(db, track_id)
 
     # 2. Snap user position to closest route (or constrained route)
     user_snap = None
@@ -1259,6 +1297,7 @@ async def get_pois_near(
                 "along_meters": round(best[2], 1),
                 "route_id": best[0],
                 "lateral_offset_m": round(best[1], 1),
+                "on_track": best[1] <= ON_TRACK_THRESHOLD_M,
             }
             user_along = best[2]
         else:
@@ -1301,6 +1340,9 @@ async def get_pois_near(
                 continue
             if direction == "behind" and ahead:
                 continue
+        # ahead_only: drop POIs known to be behind the user (keep undetermined)
+        if ahead_only and ahead is False:
+            continue
 
         # Build POI dict
         poi_name = meta.get("title") or wp.user_description or f"POI {wp.id}"
@@ -1466,10 +1508,42 @@ async def get_pois_near(
         for d in _dims_sorted
     ]
 
+    # POIs ahead of the user on the route (manual POIs only — not story/screen points),
+    # sorted by position along the route ascending (next-up first). Direction is derived
+    # from the route polyline order, not from user movement history.
+    pois_ahead = sorted(
+        [p for p in pois_with_distance
+         if p.get("ahead") and p.get("type") not in ("story_point", "screen_point")],
+        key=lambda p: p.get("along_meters") if p.get("along_meters") is not None else float("inf"),
+    )[:limit]
+
+    # Single story scene that triggers at this exact position: the closest story element
+    # whose trigger_radius (default 30m) contains the user. None if nothing triggers here.
+    story_scene_at_position = None
+    _best_scene = None
+    for p in pois_with_distance:
+        dist = p.get("distance_m")
+        if dist is None:
+            continue
+        for s in (p.get("stories") or []):
+            trigger_radius = s.get("trigger_radius") or 30
+            if dist <= trigger_radius and (_best_scene is None or dist < _best_scene[0]):
+                _best_scene = (dist, s)
+    if _best_scene:
+        s = _best_scene[1]
+        story_scene_at_position = {
+            "story": s.get("story_id"),
+            "scene": s.get("scene"),
+            "character": s.get("character"),
+            "text": s.get("text"),
+        }
+
     return {
         "track_id": track_id,
         "track_name": track.name,
         "track_dimensions": track_dimensions,
+        "pois_ahead": pois_ahead,
+        "story_scene_at_position": story_scene_at_position,
         "query": {
             "lat": lat,
             "lng": lng,
@@ -1622,6 +1696,100 @@ async def get_pois_near_pretty(
         lines.append("")
 
     return "\n".join(lines)
+
+
+class ContextAtRequest(BaseModel):
+    lat: float
+    lon: float
+    route_id: Optional[int] = None
+    radius_ahead_m: int = 200
+    radius_screen_m: int = 100
+
+
+@router.post("/{track_id}/context-at")
+async def get_context_at(
+    track_id: int,
+    body: ContextAtRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Pre-digested track context at a GPS position, for server-side prompt injection.
+
+    The guide backend calls this before each GPS update and embeds the result as a
+    TRACK_CONTEXT block in the bot prompt, so the model only narrates and never has
+    to call a tool itself. Thin adapter over get_pois_near (reuses its snap + route
+    + POI + dimension + story logic) reshaped into a stable contract:
+
+    {
+      track_id, track_name, route_id, route_name,
+      snap: {lat, lon, distance_to_path_m, progress_km, remaining_km, on_track} | null,
+      dimensions: [...],
+      pois_ahead: [{id, name, dimension, distance_along_route_m, distance_euclidean_m,
+                    approaching, at_poi}],          # ahead on route, nearest-first
+      screen_points_in_view: [ ...same shape... ],  # visual markers within radius_screen_m
+      story_scene_at_position: {story, scene, character, text} | null
+    }
+
+    Direction is derived from the route polyline order (start -> end), not from
+    user movement history.
+    """
+    radius = max(body.radius_ahead_m, body.radius_screen_m)
+    data = await get_pois_near(
+        track_id=track_id, lat=body.lat, lng=body.lon,
+        radius_m=radius, limit=25, route_id=body.route_id,
+        direction=None, ahead_only=False, include_text=True,
+        db=db, current_user=current_user,
+    )
+
+    snap = data.get("snap")
+    ri = data.get("route_intelligence")
+    user_along = snap.get("along_meters") if snap else None
+
+    snap_out = None
+    if snap:
+        snap_out = {
+            "lat": snap.get("snapped_lat"),
+            "lon": snap.get("snapped_lng"),
+            "distance_to_path_m": snap.get("lateral_offset_m"),
+            "progress_km": round((user_along or 0) / 1000, 3),
+            "remaining_km": round(ri["remaining_meters"] / 1000, 3) if ri and ri.get("remaining_meters") is not None else None,
+            "on_track": snap.get("on_track", False),
+        }
+
+    def _shape(p):
+        along = p.get("along_meters")
+        knowledge = p.get("knowledge") or {}
+        return {
+            "id": p["id"],
+            "name": p["name"],
+            "dimension": p.get("dimension"),
+            "distance_along_route_m": round(along - user_along, 1) if (along is not None and user_along is not None) else None,
+            "distance_euclidean_m": p.get("distance_m"),
+            "approaching": knowledge.get("approaching"),
+            "at_poi": knowledge.get("at_poi"),
+        }
+
+    pois_ahead = [
+        _shape(p) for p in data.get("pois_ahead", [])
+        if p.get("distance_m") is None or p["distance_m"] <= body.radius_ahead_m
+    ]
+    screen_points_in_view = [
+        _shape(p) for p in data.get("screen_points", {}).get("points", [])
+        if p.get("distance_m") is None or p["distance_m"] <= body.radius_screen_m
+    ]
+
+    return {
+        "track_id": track_id,
+        "track_name": data.get("track_name"),
+        "route_id": (ri.get("route_id") if ri else body.route_id),
+        "route_name": ri.get("route_name") if ri else None,
+        "snap": snap_out,
+        "dimensions": data.get("track_dimensions", []),
+        "pois_ahead": pois_ahead,
+        "screen_points_in_view": screen_points_in_view,
+        "story_scene_at_position": data.get("story_scene_at_position"),
+    }
 
 
 @router.get("/{track_id}/segments-pretty")
