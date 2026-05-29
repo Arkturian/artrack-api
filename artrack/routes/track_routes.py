@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from sqlalchemy.orm.attributes import flag_modified
+from typing import List, Optional, Dict, Any
 from datetime import datetime
+from pydantic import BaseModel
 
 from ..database import get_db
 from ..models import (
@@ -288,3 +290,77 @@ async def update_track(
     db.commit()
     
     return {"message": "Track updated successfully"}
+
+
+# ── Track Dimensions (curated thematic axes for AI audio guides) ──
+#
+# Tracks can carry operator-curated thematic "dimensions" (e.g. history, flora,
+# geology) stored under metadata_json["dimensions"]. An AI guide uses these to do
+# round-robin topic coverage and never drift off-track. POIs are linked to a
+# dimension via waypoint.metadata_json["dimension_slug"]. These two endpoints let
+# the track operator read/write the curated list without touching other metadata.
+
+class TrackDimension(BaseModel):
+    slug: str
+    label: Optional[str] = None
+    emoji: Optional[str] = None
+    priority: Optional[int] = None
+    description: Optional[str] = None
+    keywords: Optional[List[str]] = None
+
+
+class TrackDimensionsUpdate(BaseModel):
+    dimensions: List[TrackDimension]
+
+
+@router.get("/{track_id}/dimensions")
+async def get_track_dimensions(
+    track_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the curated thematic dimensions for a track (sorted by priority)."""
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    dims = (track.metadata_json or {}).get("dimensions") or []
+    dims = sorted(
+        [d for d in dims if isinstance(d, dict)],
+        key=lambda d: d.get("priority") if isinstance(d.get("priority"), (int, float)) else 999,
+    )
+    return {"track_id": track_id, "dimensions": dims}
+
+
+@router.put("/{track_id}/dimensions")
+async def update_track_dimensions(
+    track_id: int,
+    body: TrackDimensionsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Replace the curated thematic dimensions for a track.
+
+    Writes to Track.metadata_json["dimensions"] (merges into existing metadata,
+    leaving guide/knowledge_config and all other keys untouched). Only the track
+    creator may update.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Only track creator can update dimensions")
+
+    metadata = dict(track.metadata_json or {})
+    metadata["dimensions"] = [d.model_dump(exclude_none=True) for d in body.dimensions]
+    track.metadata_json = metadata
+    flag_modified(track, "metadata_json")
+    track.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "success": True,
+        "track_id": track_id,
+        "dimensions": metadata["dimensions"],
+    }

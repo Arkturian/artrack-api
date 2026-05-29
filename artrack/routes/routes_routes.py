@@ -1319,6 +1319,7 @@ async def get_pois_near(
             "category": category,
             "subcategory": meta.get("subcategory"),
             "route_id": user_route_id,
+            "dimension": meta.get("dimension_slug"),
         }
 
         if include_text:
@@ -1442,9 +1443,33 @@ async def get_pois_near(
             "next_poi_ahead": next_poi,
         }
 
+    # Track-level curated dimensions (metadata_json.dimensions), sorted by priority.
+    # Each is annotated with the in-range POIs tagged to it (waypoint.metadata_json.dimension_slug)
+    # so an AI guide can do round-robin coverage without ever drifting off-track.
+    track_meta = track.metadata_json or {}
+    _dims_def = track_meta.get("dimensions") or []
+    _dims_sorted = sorted(
+        [d for d in _dims_def if isinstance(d, dict)],
+        key=lambda d: d.get("priority") if isinstance(d.get("priority"), (int, float)) else 999,
+    )
+    _dim_pois = {}
+    for _p in pois_with_distance:
+        _slug = _p.get("dimension")
+        if _slug:
+            _dim_pois.setdefault(_slug, []).append({
+                "id": _p["id"],
+                "name": _p["name"],
+                "distance_m": _p["distance_m"],
+            })
+    track_dimensions = [
+        {**d, "pois_in_range": _dim_pois.get(d.get("slug"), [])}
+        for d in _dims_sorted
+    ]
+
     return {
         "track_id": track_id,
         "track_name": track.name,
+        "track_dimensions": track_dimensions,
         "query": {
             "lat": lat,
             "lng": lng,
@@ -1507,6 +1532,24 @@ async def get_pois_near_pretty(
     lines.append(f"User position: {lat:.5f}, {lng:.5f} (radius {radius_m}m)")
     lines.append("")
 
+    # ── Track Dimensions (curated by track operator) ──
+    track_dims = data.get("track_dimensions") or []
+    if track_dims:
+        lines.append("## Track Dimensions (sortiert nach priority, kuratiert vom Track-Betreiber)")
+        for d in track_dims:
+            emoji = d.get("emoji") or ""
+            slug = d.get("slug") or "?"
+            desc = d.get("description") or d.get("label") or ""
+            header = f"{emoji} {slug} — {desc}".strip()
+            lines.append(f"\n{header}")
+            pr = d.get("pois_in_range") or []
+            if pr:
+                poi_str = ", ".join(f"#{x['id']} {x['name']} ({x['distance_m']}m)" for x in pr)
+                lines.append(f"   POIs in Range: {poi_str}")
+            else:
+                lines.append("   POIs in Range: (keine in Range)")
+        lines.append("")
+
     # ── Route Intelligence ──
     ri = data.get("route_intelligence")
     if ri:
@@ -1534,7 +1577,8 @@ async def get_pois_near_pretty(
     for p in pois:
         ahead = "→" if p.get("ahead") else ("←" if p.get("ahead") == False else "·")
         cat = f"{p.get('category')}/{p.get('subcategory')}" if p.get('subcategory') else p.get('category', '')
-        lines.append(f"\n### {ahead} {p['name']} (#{p['id']}, {p['distance_m']}m, {cat})")
+        dim_tag = f" [dimension={p['dimension']}]" if p.get("dimension") else ""
+        lines.append(f"\n### {ahead} {p['name']} (#{p['id']}, {p['distance_m']}m, {cat}){dim_tag}")
         k = p.get("knowledge", {})
         if k.get("approaching"):
             lines.append(f"  approaching: {k['approaching']}")
