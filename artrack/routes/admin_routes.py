@@ -12,6 +12,7 @@ import os
 from ..database import get_db
 from ..models import User, Track, Waypoint, MediaFile, AnalysisJob, StorageObject
 from ..auth import get_current_user
+from ..storage_domain import cleanup_storage_refs
 from clients.storage_client import generic_storage
 
 router = APIRouter()
@@ -694,17 +695,56 @@ def admin_storage_delete(
         print(f"🗑️ Deleted original file: {obj.object_key}")
     except Exception as e:
         print(f"⚠️ Could not delete original file: {e}")
-    
+
+    # Cascade-cleanup: sweep all references across waypoints, tracks, routes,
+    # media_files BEFORE deleting the row. Same transaction so it's atomic.
+    # Without this, dangling refs become 404s in consuming apps (POIs without
+    # icons, screen_points without videos) — exactly what we just had to
+    # manually clean for 12 orphan IDs.
+    ref_cleanup = cleanup_storage_refs(db, object_id)
+    print(f"🧹 Ref cleanup for storage {object_id}: {ref_cleanup}")
+
     # Delete DB row
     db.delete(obj)
     db.commit()
-    
+
     # Build response message
     message_parts = ["Storage object deleted"]
     if mac_job_cancelled:
         message_parts.append("Mac transcoding cancelled")
     if hls_deleted:
         message_parts.append("HLS files deleted")
-    
-    return {"message": " + ".join(message_parts)}
+    ref_total = sum(ref_cleanup.values())
+    if ref_total:
+        message_parts.append(f"{ref_total} refs cleaned")
+
+    return {"message": " + ".join(message_parts), "refs_cleaned": ref_cleanup}
+
+
+@router.post("/storage/{object_id}/cleanup-refs", response_model=dict)
+def admin_storage_cleanup_refs(
+    object_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cascade-clean references to a deleted storage object.
+
+    Called by storage-api after a successful DELETE to keep artrack's
+    denormalized refs (media_files, JSON lists on tracks/track_routes,
+    waypoint metadata) in sync — closes the foreign-key gap between the
+    two services. Safe to call idempotently: if the object_id is already
+    not referenced anywhere, returns all-zero counters.
+
+    Does NOT delete the StorageObject row itself (storage-api owns that
+    table for live objects; artrack only mirrors). The mirror row, if
+    any, gets pruned naturally by the next sync.
+    """
+    _ensure_admin(current_user)
+    summary = cleanup_storage_refs(db, object_id)
+    db.commit()
+    logger.info(
+        "[admin_storage_cleanup_refs] storage=%s refs_cleaned=%s",
+        object_id, summary,
+    )
+    return {"storage_id": object_id, "refs_cleaned": summary}
 

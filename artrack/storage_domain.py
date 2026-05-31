@@ -1,10 +1,94 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
-from .models import StorageObject
+from .models import StorageObject, MediaFile, Track, TrackRoute, Waypoint
 from clients.storage_client import generic_storage
+
+
+def cleanup_storage_refs(db: Session, storage_id: int) -> dict[str, int]:
+    """Cascade-clean every reference to a StorageObject before it's deleted.
+
+    Background: the FK relationship between artrack and storage objects is
+    not enforced everywhere — denormalized refs live in five places:
+
+      1. media_files.storage_object_id        (relational FK)
+      2. tracks.storage_object_ids            (JSON list)
+      3. track_routes.storage_object_ids      (JSON list)
+      4. waypoints.metadata_json.assets       (JSON list of ints or {id,role})
+      5. waypoints.metadata_json.{thumbnail_url, file_url, hls_url}
+         (URL strings containing the storage id segment)
+
+    Deleting a storage object without sweeping these leaves dangling
+    references that surface as 404s in consuming apps (POIs without icons,
+    screen_points without videos). This helper is the cascade glue.
+
+    Call BEFORE ``db.delete(storage_object)`` — both should happen in the
+    same transaction so the cleanup either commits whole or rolls back.
+
+    Returns a summary dict so callers can log / return the impact:
+        {media_files, tracks, track_routes, waypoints_assets, waypoints_urls}
+    """
+    summary = {
+        "media_files": 0,
+        "tracks": 0,
+        "track_routes": 0,
+        "waypoints_assets": 0,
+        "waypoints_urls": 0,
+    }
+
+    # 1. media_files: delete junction rows
+    summary["media_files"] = (
+        db.query(MediaFile)
+        .filter(MediaFile.storage_object_id == storage_id)
+        .delete(synchronize_session=False)
+    )
+
+    # 2-3. JSON lists on tracks + track_routes
+    for model, field in [(Track, "tracks"), (TrackRoute, "track_routes")]:
+        for row in db.query(model).all():
+            ids = getattr(row, "storage_object_ids", None) or []
+            if storage_id in ids:
+                row.storage_object_ids = [i for i in ids if i != storage_id]
+                flag_modified(row, "storage_object_ids")
+                summary[field] += 1
+
+    # 4-5. waypoints.metadata_json — assets[] and URL fields
+    url_pat = re.compile(rf"/storage/(?:media|objects)/{storage_id}(?:[?/&#]|$)")
+
+    def _asset_id(a):
+        if isinstance(a, int):
+            return a
+        if isinstance(a, dict):
+            return a.get("id")
+        return None
+
+    for wp in db.query(Waypoint).all():
+        md = wp.metadata_json or {}
+        changed = False
+
+        assets = md.get("assets") or []
+        new_assets = [a for a in assets if _asset_id(a) != storage_id]
+        if len(new_assets) != len(assets):
+            md["assets"] = new_assets
+            changed = True
+            summary["waypoints_assets"] += 1
+
+        for fld in ("thumbnail_url", "file_url", "hls_url"):
+            v = md.get(fld)
+            if isinstance(v, str) and url_pat.search(v):
+                md[fld] = None
+                changed = True
+                summary["waypoints_urls"] += 1
+
+        if changed:
+            wp.metadata_json = md
+            flag_modified(wp, "metadata_json")
+
+    return summary
 
 
 async def save_file_and_record(
