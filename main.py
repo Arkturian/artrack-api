@@ -35,6 +35,7 @@ from artrack.routes import (
     knowledge_routes,
     osm_routes,
     places_routes,
+    admin_routes,
 )
 
 # Create database tables
@@ -75,6 +76,10 @@ app.include_router(categories_routes.router, prefix="/categories", tags=["Catego
 app.include_router(knowledge_routes.router, prefix="/tracks", tags=["Route Knowledge"])
 app.include_router(osm_routes.router, prefix="/osm", tags=["OpenStreetMap"])
 app.include_router(places_routes.router, prefix="/places", tags=["Google Places"])
+# Admin endpoints (system stats, storage cascade-cleanup, moderation) — was
+# defined but never mounted; mounting now so the cleanup-refs callback used
+# by storage-api becomes reachable.
+app.include_router(admin_routes.router, prefix="/admin", tags=["Admin"])
 
 @app.get("/")
 def root():
