@@ -1768,6 +1768,7 @@ async def get_context_at(
             "distance_euclidean_m": p.get("distance_m"),
             "approaching": knowledge.get("approaching"),
             "at_poi": knowledge.get("at_poi"),
+            "description": p.get("description"),
         }
 
     pois_ahead = [
