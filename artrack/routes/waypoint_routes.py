@@ -19,6 +19,7 @@ from ..models import (
     MediaAnalysis, User, WaypointDetailResponse, WaypointListItem, WaypointLocation, SimpleUserRef, StorageObject
 )
 from ..auth import get_current_user
+from ..asset_urls import enrich_assets_in_metadata
 from artrack.storage_domain import save_file_and_record
 from clients.storage_client import generic_storage, enqueue_ai_safety_and_transcoding
 from ..analysis import analysis_service
@@ -236,7 +237,7 @@ async def list_waypoints_detail(
             processing_state=wp.processing_state,
             moderation_status=wp.moderation_status,
             waypoint_type=wp.waypoint_type,
-            metadata_json=wp.metadata_json,
+            metadata_json=enrich_assets_in_metadata(wp.metadata_json),
             segment_id=wp.segment_id,
             priority=getattr(wp, 'priority', None),
             media=[MediaFileResponse(
@@ -889,7 +890,7 @@ async def get_waypoint_detail(
         processing_state=waypoint.processing_state,
         moderation_status=waypoint.moderation_status,
         waypoint_type=waypoint.waypoint_type,
-        metadata_json=waypoint.metadata_json,
+        metadata_json=enrich_assets_in_metadata(waypoint.metadata_json),
         media=media
     )
 

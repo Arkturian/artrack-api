@@ -9,6 +9,7 @@ import time
 from ..database import get_db
 from ..auth import get_current_user
 from ..models import Track, TrackRoute as TrackRouteModel, Waypoint
+from ..asset_urls import enrich_asset
 from pydantic import BaseModel
 from .track_report_generator import generate_track_report
 
@@ -1424,6 +1425,9 @@ async def get_pois_near(
             poi_data["audio_id"] = audio_id
             poi_data["illustration_id"] = illustration_id
             poi_data["icon_id"] = icon_id
+            # Host-correct resolved URLs per asset (file_url/thumbnail_url) so
+            # clients consume them 1:1 instead of building a storage host.
+            poi_data["assets"] = [enrich_asset(a) for a in assets if isinstance(a, dict)]
 
         pois_with_distance.append(poi_data)
 
@@ -1760,6 +1764,9 @@ async def get_context_at(
     def _shape(p):
         along = p.get("along_meters")
         knowledge = p.get("knowledge") or {}
+        # main asset resolved url (host-correct), else first asset
+        assets = p.get("assets") or []
+        main = next((a for a in assets if a.get("role") == "main"), assets[0] if assets else None)
         return {
             "id": p["id"],
             "name": p["name"],
@@ -1769,6 +1776,9 @@ async def get_context_at(
             "approaching": knowledge.get("approaching"),
             "at_poi": knowledge.get("at_poi"),
             "description": p.get("description"),
+            "assets": assets,
+            "file_url": main.get("file_url") if main else None,
+            "thumbnail_url": main.get("thumbnail_url") if main else None,
         }
 
     pois_ahead = [

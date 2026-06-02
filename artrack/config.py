@@ -24,6 +24,11 @@ class Settings:
     UPLOAD_DIR: str = os.getenv("ARTRACK_UPLOAD_DIR", "./uploads/artrack")
     STORAGE_UPLOAD_DIR: str = os.getenv("STORAGE_UPLOAD_DIR", "./uploads/storage")
     BASE_URL: str = os.getenv("ARTRACK_BASE_URL", "https://api.arkturian.com")
+    # Default storage host for assets that carry no explicit per-asset
+    # storage_host marker (legacy assets). Resolved into file_url/thumbnail_url
+    # by artrack.asset_urls.enrich_assets. Per-asset metadata may override this
+    # (e.g. assets migrated to arkserver carry storage_host=arkserver).
+    STORAGE_DEFAULT_HOST: str = os.getenv("ARTRACK_STORAGE_DEFAULT_HOST", "https://api-storage.arkturian.com")
     
     # API Keys
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
