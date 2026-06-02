@@ -46,6 +46,21 @@ def enrich_asset(asset: dict) -> dict:
     return out
 
 
+def resolve_audio_url(audio_storage_id: Any, storage_host: Optional[str] = None) -> Optional[str]:
+    """Resolve a host-correct media URL for a TTS audio cue.
+
+    Audio cues live in knowledge.<slot>.cues[].audio_storage_id (not in assets[]),
+    so they need their own resolver. An optional per-cue ``audio_storage_host``
+    marks a migrated audio; without it we fall back to STORAGE_DEFAULT_HOST
+    (arkturian today), which is correct as long as the audio still lives there
+    (copy-not-move migration keeps the original reachable).
+    """
+    if audio_storage_id is None:
+        return None
+    host = storage_host or settings.STORAGE_DEFAULT_HOST
+    return _media_url(host, audio_storage_id)
+
+
 def enrich_assets_in_metadata(metadata: Optional[dict]) -> Optional[dict]:
     """Return a shallow copy of waypoint metadata_json with metadata["assets"]
     asset entries enriched (file_url/thumbnail_url). No-op if there are no

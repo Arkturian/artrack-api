@@ -9,7 +9,7 @@ import time
 from ..database import get_db
 from ..auth import get_current_user
 from ..models import Track, TrackRoute as TrackRouteModel, Waypoint
-from ..asset_urls import enrich_asset
+from ..asset_urls import enrich_asset, resolve_audio_url
 from pydantic import BaseModel
 from .track_report_generator import generate_track_report
 
@@ -1374,6 +1374,19 @@ async def get_pois_near(
                 "at_poi": at_poi.get("text") if isinstance(at_poi, dict) else None,
             }
             poi_data["radius_m"] = meta.get("radiusMeters")
+            # Host-resolved audio URL from the first cue carrying an audio_storage_id
+            # (TTS narration). Per-cue audio_storage_host marks a migrated audio.
+            for _blk in (approaching, at_poi):
+                if not isinstance(_blk, dict):
+                    continue
+                for _cue in (_blk.get("cues") or []):
+                    if isinstance(_cue, dict) and _cue.get("audio_storage_id"):
+                        poi_data["audio_url"] = resolve_audio_url(
+                            _cue["audio_storage_id"], _cue.get("audio_storage_host")
+                        )
+                        break
+                if poi_data.get("audio_url"):
+                    break
 
             # Stories at this POI (knowledge.story.{story_id} from POIs,
             # OR direct fields on story_point waypoints)
@@ -1662,7 +1675,19 @@ async def get_pois_near_pretty(
             lines.append(f"  approaching: {k['approaching']}")
         if k.get("at_poi"):
             lines.append(f"  at_poi: {k['at_poi']}")
-        if p.get("audio_id"):
+        # Host-correct image URL (main/icon asset) — consumed directly by the
+        # realtime guide bot via pois_near_pretty. Resolved by AP1, so it follows
+        # the asset's storage_host (arkserver after migration).
+        _assets = p.get("assets") or []
+        _img = next((a for a in _assets if a.get("role") == "main"), None) \
+            or next((a for a in _assets if a.get("role") == "icon"), None) \
+            or (_assets[0] if _assets else None)
+        if _img and _img.get("file_url"):
+            lines.append(f"  image: {_img['file_url']}")
+        # Audio narration URL for this POI (host-resolved) — see audio cues below
+        if p.get("audio_url"):
+            lines.append(f"  audio: {p['audio_url']}")
+        elif p.get("audio_id"):
             lines.append(f"  audio: storage_id={p['audio_id']}")
         if p.get("illustration_id"):
             lines.append(f"  illustration: storage_id={p['illustration_id']}")
@@ -1779,6 +1804,7 @@ async def get_context_at(
             "assets": assets,
             "file_url": main.get("file_url") if main else None,
             "thumbnail_url": main.get("thumbnail_url") if main else None,
+            "audio_url": p.get("audio_url"),
         }
 
     pois_ahead = [
