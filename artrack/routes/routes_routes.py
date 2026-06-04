@@ -2226,3 +2226,111 @@ async def capture_narrative(
     
     return {"success": True, "id": waypoint.id, "updated": False, "reason": "overwrite_disabled"}
 
+
+# ── Knowledge linkage (waypoint ↔ knowledge object) ───────────────────────────
+# A waypoint (typically a screen_point photo/video) can be linked to a Knowledge
+# object (e.g. a Flora/Fauna species steckbrief) via its knowledge_id, stored in
+# waypoint.metadata_json["knowledge_id"]. This is the REVERSE direction of the
+# geo-lookup Knowledge offers (pos+radius → species): here we answer
+# "give me all screen_points that show knowledge object X". Independent of and
+# complementary to Knowledge's own /knowledge/near endpoint.
+
+class KnowledgeLinkBatch(BaseModel):
+    # { "<waypoint_id>": <knowledge_id>, ... }  (knowledge_id null/None clears the link)
+    links: dict
+
+
+@router.put("/{track_id}/waypoints/knowledge-links")
+async def set_waypoint_knowledge_links(
+    track_id: int,
+    body: KnowledgeLinkBatch,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Batch-set metadata_json.knowledge_id on waypoints of a track.
+    Body: {"links": {"24977": 285, "24988": 286, "24990": null}}
+    null clears the link. Only the track creator may modify.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Only track creator can set knowledge links")
+
+    from sqlalchemy.orm.attributes import flag_modified
+    updated, skipped = [], []
+    for wp_id_str, kid in body.links.items():
+        try:
+            wp = db.query(Waypoint).filter(
+                Waypoint.id == int(wp_id_str), Waypoint.track_id == track_id
+            ).first()
+        except (ValueError, TypeError):
+            wp = None
+        if not wp:
+            skipped.append({"id": wp_id_str, "reason": "not_found"})
+            continue
+        meta = dict(wp.metadata_json or {})
+        if kid is None:
+            meta.pop("knowledge_id", None)
+        else:
+            meta["knowledge_id"] = kid
+        wp.metadata_json = meta
+        flag_modified(wp, "metadata_json")
+        updated.append(int(wp_id_str))
+    if updated:
+        db.commit()
+    return {"track_id": track_id, "updated": updated, "skipped": skipped}
+
+
+@router.get("/waypoints/by-knowledge/{knowledge_id}")
+async def get_waypoints_by_knowledge(
+    knowledge_id: int,
+    track_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Return all waypoints (screen_points/POIs) linked to a given knowledge_id —
+    i.e. every place where this knowledge object (e.g. a species) is shown.
+    Reverse of Knowledge's geo-lookup. Optionally constrain to one track.
+
+    Returns: {knowledge_id, count, waypoints: [{id, track_id, lat, lng,
+              waypoint_type, title, assets, source_collection}]}
+    """
+    q = db.query(Waypoint)
+    if track_id is not None:
+        q = q.filter(Waypoint.track_id == track_id)
+
+    # Try a DB-side JSON filter (SQLite/Postgres json_extract); fall back to
+    # in-Python filtering if the backend doesn't support it.
+    rows = []
+    try:
+        from sqlalchemy import func, cast, Integer
+        rows = q.filter(
+            func.json_extract(Waypoint.metadata_json, "$.knowledge_id") == knowledge_id
+        ).all()
+    except Exception:
+        rows = []
+    if not rows:
+        # Fallback / safety net: scan candidates in Python (covers type quirks,
+        # e.g. knowledge_id stored as str, and non-json_extract backends).
+        candidates = q.all()
+        rows = [w for w in candidates
+                if str((w.metadata_json or {}).get("knowledge_id")) == str(knowledge_id)]
+
+    out = []
+    for w in rows:
+        meta = w.metadata_json or {}
+        out.append({
+            "id": w.id,
+            "track_id": w.track_id,
+            "lat": w.latitude,
+            "lng": w.longitude,
+            "waypoint_type": w.waypoint_type,
+            "title": meta.get("title"),
+            "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
+            "source_collection": meta.get("source_collection"),
+        })
+    return {"knowledge_id": knowledge_id, "count": len(out), "waypoints": out}
+
