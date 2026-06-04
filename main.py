@@ -20,6 +20,24 @@ from artrack.database import engine, Base
 from artrack import models
 from artrack import collaboration_models
 
+# ---------------------------------------------------------------------------
+# Logging — route artrack.* app loggers (incl. artrack.event_bus, used by the
+# producer event-bus hook) to stderr so gunicorn/uvicorn captures them in the
+# service error-log. Scoped to the "artrack" namespace so third-party loggers
+# (httpx, sqlalchemy) keep their own (quieter) levels. Without this the app's
+# INFO/WARNING logs are swallowed and the fire-and-forget publish is "blind".
+# ---------------------------------------------------------------------------
+import logging as _logging
+import sys as _sys
+
+_artrack_log = _logging.getLogger("artrack")
+if not _artrack_log.handlers:
+    _h = _logging.StreamHandler(_sys.stderr)
+    _h.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _artrack_log.addHandler(_h)
+    _artrack_log.setLevel(_logging.INFO)
+    _artrack_log.propagate = False
+
 from artrack.routes import (
     track_routes,
     waypoint_routes,
