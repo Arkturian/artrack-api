@@ -12,7 +12,7 @@ import os
 from ..database import get_db
 from ..models import User, Track, Waypoint, MediaFile, AnalysisJob, StorageObject
 from ..auth import get_current_user
-from ..storage_domain import cleanup_storage_refs
+from ..storage_domain import cleanup_storage_refs, find_storage_refs
 from clients.storage_client import generic_storage
 
 router = APIRouter()
@@ -747,4 +747,24 @@ def admin_storage_cleanup_refs(
         object_id, summary,
     )
     return {"storage_id": object_id, "refs_cleaned": summary}
+
+
+@router.get("/storage/{object_id}/refs", response_model=dict)
+def admin_storage_find_refs(
+    object_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only: which artrack entities reference this storage object?
+
+    The 'who is affected' step a cross-service delete workflow (e.g. sWFME)
+    runs BEFORE removing the bytes — so the orchestrator knows the blast
+    radius and can decide/Saga-rollback. Mutates nothing. Mirror of
+    cleanup_storage_refs' ref locations.
+
+    Returns {storage_id, total, waypoints:[{id,track_id,via}], tracks:[],
+    track_routes:[], media_files:[]}.
+    """
+    _ensure_admin(current_user)
+    return find_storage_refs(db, object_id)
 

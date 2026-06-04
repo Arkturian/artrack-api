@@ -38,6 +38,7 @@ def cleanup_storage_refs(db: Session, storage_id: int) -> dict[str, int]:
         "track_routes": 0,
         "waypoints_assets": 0,
         "waypoints_urls": 0,
+        "waypoints_audio_cues": 0,
     }
 
     # 1. media_files: delete junction rows
@@ -84,11 +85,81 @@ def cleanup_storage_refs(db: Session, storage_id: int) -> dict[str, int]:
                 changed = True
                 summary["waypoints_urls"] += 1
 
+        # 6. TTS audio cues — knowledge.<slot>.cues[].audio_storage_id
+        kn = md.get("knowledge")
+        if isinstance(kn, dict):
+            for slot in ("approaching", "at_poi"):
+                blk = kn.get(slot)
+                if not isinstance(blk, dict):
+                    continue
+                for cue in (blk.get("cues") or []):
+                    if isinstance(cue, dict) and cue.get("audio_storage_id") == storage_id:
+                        cue["audio_storage_id"] = None
+                        changed = True
+                        summary["waypoints_audio_cues"] += 1
+
         if changed:
             wp.metadata_json = md
             flag_modified(wp, "metadata_json")
 
     return summary
+
+
+def find_storage_refs(db: Session, storage_id: int) -> dict:
+    """Read-only: who references this StorageObject? For a delete-cascade
+    workflow's 'who is affected' step BEFORE the bytes are removed (e.g. sWFME).
+
+    Mirrors cleanup_storage_refs' five+1 ref locations but mutates nothing.
+    Returns {storage_id, total, waypoints:[{id,track_id,via}], tracks:[id],
+    track_routes:[id], media_files:[id]}.
+    """
+    url_pat = re.compile(rf"/storage/(?:media|objects)/{storage_id}(?:[?/&#]|$)")
+
+    def _asset_id(a):
+        if isinstance(a, int):
+            return a
+        if isinstance(a, dict):
+            return a.get("id")
+        return None
+
+    wp_hits = []
+    for wp in db.query(Waypoint).all():
+        md = wp.metadata_json or {}
+        via = []
+        if any(_asset_id(a) == storage_id for a in (md.get("assets") or [])):
+            via.append("assets")
+        for fld in ("thumbnail_url", "file_url", "hls_url"):
+            v = md.get(fld)
+            if isinstance(v, str) and url_pat.search(v):
+                via.append(fld)
+        kn = md.get("knowledge")
+        if isinstance(kn, dict):
+            for slot in ("approaching", "at_poi"):
+                blk = kn.get(slot)
+                if isinstance(blk, dict) and any(
+                    isinstance(c, dict) and c.get("audio_storage_id") == storage_id
+                    for c in (blk.get("cues") or [])
+                ):
+                    via.append(f"knowledge.{slot}.cues")
+        if via:
+            wp_hits.append({"id": wp.id, "track_id": wp.track_id, "via": via})
+
+    track_hits = [t.id for t in db.query(Track).all()
+                  if storage_id in (getattr(t, "storage_object_ids", None) or [])]
+    route_hits = [r.id for r in db.query(TrackRoute).all()
+                  if storage_id in (getattr(r, "storage_object_ids", None) or [])]
+    media_hits = [m.id for m in db.query(MediaFile).filter(
+        MediaFile.storage_object_id == storage_id).all()]
+
+    total = len(wp_hits) + len(track_hits) + len(route_hits) + len(media_hits)
+    return {
+        "storage_id": storage_id,
+        "total": total,
+        "waypoints": wp_hits,
+        "tracks": track_hits,
+        "track_routes": route_hits,
+        "media_files": media_hits,
+    }
 
 
 async def save_file_and_record(
