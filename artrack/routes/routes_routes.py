@@ -2236,8 +2236,43 @@ async def capture_narrative(
 # complementary to Knowledge's own /knowledge/near endpoint.
 
 class KnowledgeLinkBatch(BaseModel):
-    # { "<waypoint_id>": <knowledge_id>, ... }  (knowledge_id null/None clears the link)
+    # { "<waypoint_id>": <value>, ... } where value is:
+    #   - an int           → single knowledge link
+    #   - a list of ints   → multiple knowledge links (1:n, e.g. an info board)
+    #   - null / []        → clear all links
     links: dict
+
+
+def _normalize_kids(value) -> list:
+    """Coerce a link value (int | list | null) into a clean list of int ids."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+    else:
+        seq = [value]
+    out = []
+    for v in seq:
+        if v is None:
+            continue
+        try:
+            iv = int(v)
+        except (ValueError, TypeError):
+            continue
+        if iv not in out:
+            out.append(iv)
+    return out
+
+
+def _apply_knowledge_ids(meta: dict, kids: list) -> None:
+    """Write canonical knowledge_ids[] plus mirrored scalar knowledge_id (first,
+    backward-compatible for readers that only know the scalar). Empty clears both."""
+    if kids:
+        meta["knowledge_ids"] = kids
+        meta["knowledge_id"] = kids[0]
+    else:
+        meta.pop("knowledge_ids", None)
+        meta.pop("knowledge_id", None)
 
 
 @router.put("/{track_id}/waypoints/knowledge-links")
@@ -2248,9 +2283,15 @@ async def set_waypoint_knowledge_links(
     current_user = Depends(get_current_user),
 ):
     """
-    Batch-set metadata_json.knowledge_id on waypoints of a track.
-    Body: {"links": {"24977": 285, "24988": 286, "24990": null}}
-    null clears the link. Only the track creator may modify.
+    Batch-set knowledge links on waypoints of a track.
+
+    A waypoint may link to one OR several knowledge objects (1:n — e.g. an info
+    board showing 3 animals). Canonical storage: metadata_json.knowledge_ids[]
+    (list); metadata_json.knowledge_id mirrors the first entry for backward compat.
+
+    Body: {"links": {"24977": 285, "24988": [83, 267], "24990": null}}
+      int → single link · list → multiple links · null/[] → clear.
+    Only the track creator may modify.
     """
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
@@ -2260,7 +2301,7 @@ async def set_waypoint_knowledge_links(
 
     from sqlalchemy.orm.attributes import flag_modified
     updated, skipped = [], []
-    for wp_id_str, kid in body.links.items():
+    for wp_id_str, value in body.links.items():
         try:
             wp = db.query(Waypoint).filter(
                 Waypoint.id == int(wp_id_str), Waypoint.track_id == track_id
@@ -2271,10 +2312,7 @@ async def set_waypoint_knowledge_links(
             skipped.append({"id": wp_id_str, "reason": "not_found"})
             continue
         meta = dict(wp.metadata_json or {})
-        if kid is None:
-            meta.pop("knowledge_id", None)
-        else:
-            meta["knowledge_id"] = kid
+        _apply_knowledge_ids(meta, _normalize_kids(value))
         wp.metadata_json = meta
         flag_modified(wp, "metadata_json")
         updated.append(int(wp_id_str))
@@ -2302,26 +2340,23 @@ async def get_waypoints_by_knowledge(
     if track_id is not None:
         q = q.filter(Waypoint.track_id == track_id)
 
-    # Try a DB-side JSON filter (SQLite/Postgres json_extract); fall back to
-    # in-Python filtering if the backend doesn't support it.
-    rows = []
-    try:
-        from sqlalchemy import func, cast, Integer
-        rows = q.filter(
-            func.json_extract(Waypoint.metadata_json, "$.knowledge_id") == knowledge_id
-        ).all()
-    except Exception:
-        rows = []
-    if not rows:
-        # Fallback / safety net: scan candidates in Python (covers type quirks,
-        # e.g. knowledge_id stored as str, and non-json_extract backends).
-        candidates = q.all()
-        rows = [w for w in candidates
-                if str((w.metadata_json or {}).get("knowledge_id")) == str(knowledge_id)]
+    # Match against the canonical knowledge_ids[] list AND the legacy scalar
+    # knowledge_id (1:1 records). Done in Python for robustness across backends
+    # and JSON shapes (list-contains is awkward/non-portable in json_extract).
+    def _linked(meta: dict) -> bool:
+        ids = meta.get("knowledge_ids")
+        if isinstance(ids, list) and any(str(x) == str(knowledge_id) for x in ids):
+            return True
+        return str(meta.get("knowledge_id")) == str(knowledge_id)
+
+    rows = [w for w in q.all() if _linked(w.metadata_json or {})]
 
     out = []
     for w in rows:
         meta = w.metadata_json or {}
+        kids = meta.get("knowledge_ids")
+        if not isinstance(kids, list):
+            kids = [meta["knowledge_id"]] if meta.get("knowledge_id") is not None else []
         out.append({
             "id": w.id,
             "track_id": w.track_id,
@@ -2329,6 +2364,7 @@ async def get_waypoints_by_knowledge(
             "lng": w.longitude,
             "waypoint_type": w.waypoint_type,
             "title": meta.get("title"),
+            "knowledge_ids": kids,
             "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
             "source_collection": meta.get("source_collection"),
         })
