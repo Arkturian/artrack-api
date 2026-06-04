@@ -18,6 +18,9 @@ pydantic-settings==2.1.0
 # HTTP Client (for Storage API calls)
 httpx==0.25.1
 
+# Event Bus (IACP Redis PubSub — publishes swfme webhook trigger events)
+redis==5.0.1
+
 # Audio/TTS Services
 elevenlabs==0.2.27
 openai==1.3.0

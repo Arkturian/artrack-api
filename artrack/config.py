@@ -41,6 +41,14 @@ class Settings:
 
     # Content API (for narration storage)
     CONTENT_API_BASE: str = os.getenv("CONTENT_API_BASE", "https://content-api.arkturian.com")
+
+    # Event Bus (IACP Redis PubSub). artrack publishes fire-and-forget events
+    # (e.g. waypoint_deleted) to `swfme.webhook.{event}` topics; the swfme-api
+    # WebhookWorker subscribes and async-triggers the matching workflow.
+    # Decoupled: artrack knows the bus, not swfme's URL/auth. URL carries auth
+    # (federation standard IACP_REDIS_URL). Disable with EVENT_BUS_ENABLED=false.
+    REDIS_URL: str = os.getenv("ARTRACK_REDIS_URL") or os.getenv("IACP_REDIS_URL") or "redis://127.0.0.1:6379/0"
+    EVENT_BUS_ENABLED: bool = os.getenv("ARTRACK_EVENT_BUS_ENABLED", "true").lower() in ("1", "true", "yes")
     
     # Media Settings
     MAX_FILE_SIZE: int = int(os.getenv("ARTRACK_MAX_FILE_SIZE", "52428800"))  # 50MB

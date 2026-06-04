@@ -1006,10 +1006,27 @@ async def delete_waypoint(
     if not track or (track.created_by != current_user.id and track.visibility == "private"):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # Capture before delete (waypoint is expired after commit).
+    track_id = waypoint.track_id
+
     # Delete media file records referencing the waypoint
     db.query(MediaFile).filter(MediaFile.waypoint_id == waypoint_id).delete()
     db.delete(waypoint)
     db.commit()
+
+    # Producer-cascade: announce the deletion on the IACP event-bus so swfme-api
+    # triggers CascadeDeleteWaypoint → Knowledge cleans its dangling
+    # locations[].waypoint_id refs. Fire-and-forget: must never break the delete.
+    try:
+        from ..event_bus import publish_event
+        await publish_event(
+            "artrack.waypoint_deleted",
+            {"waypoint_id": waypoint_id, "tenant_id": "arkturian", "track_id": track_id},
+        )
+    except Exception:
+        logging.getLogger("artrack.waypoints").debug(
+            "waypoint_deleted event publish skipped (non-fatal)", exc_info=True
+        )
 
     return {"message": "Waypoint deleted"}
 
