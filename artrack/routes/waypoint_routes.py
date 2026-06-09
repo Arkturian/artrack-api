@@ -144,7 +144,7 @@ async def get_waypoint_status(
     
     # Check permissions
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if track.created_by != current_user.id and track.visibility == "private":
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Get media files and their analysis results
@@ -205,7 +205,7 @@ async def list_waypoints_detail(
         raise HTTPException(status_code=404, detail="Track not found")
     # Admins may access any track; otherwise enforce privacy
     if not _is_admin(current_user):
-        if track.created_by != current_user.id and track.visibility == "private":
+        if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
             raise HTTPException(status_code=403, detail="Access denied")
 
     query = db.query(Waypoint).filter(Waypoint.track_id == track_id)
@@ -560,7 +560,7 @@ async def list_waypoints(
             raise HTTPException(status_code=404, detail="Track not found")
         # Admins may access any track; otherwise enforce privacy
         if not _is_admin(current_user):
-            if track.created_by != current_user.id and track.visibility == "private":
+            if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
                 raise HTTPException(status_code=403, detail="Access denied")
         
         query = query.filter(Waypoint.track_id == track_id)
@@ -874,7 +874,7 @@ async def get_waypoint_detail(
     if not waypoint:
         raise HTTPException(status_code=404, detail="Waypoint not found")
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private"):
+    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
         raise HTTPException(status_code=403, detail="Access denied")
     media_files = db.query(MediaFile).filter(MediaFile.waypoint_id == waypoint_id).all()
     media = [MediaFileResponse(media_id=m.id, type=m.media_type, processing_state=m.processing_state, thumbnail_url=m.thumbnail_url, url=m.file_url, storage_object_id=getattr(m, 'storage_object_id', None)) for m in media_files]
@@ -907,7 +907,7 @@ async def update_waypoint(
         raise HTTPException(status_code=404, detail="Waypoint not found")
 
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private"):
+    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     if update.description is not None:
@@ -955,7 +955,7 @@ async def attach_storage_to_waypoint(
     if not waypoint:
         raise HTTPException(status_code=404, detail="Waypoint not found")
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private"):
+    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
         raise HTTPException(status_code=403, detail="Access denied")
     attached = 0
     skipped = 0
@@ -1003,7 +1003,7 @@ async def delete_waypoint(
         raise HTTPException(status_code=404, detail="Waypoint not found")
 
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private"):
+    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Capture before delete (waypoint is expired after commit).
@@ -1045,7 +1045,7 @@ async def bulk_delete_waypoints(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id and track.visibility == "private":
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
         raise HTTPException(status_code=403, detail="Access denied")
 
     q = db.query(Waypoint).filter(Waypoint.track_id == track_id)
