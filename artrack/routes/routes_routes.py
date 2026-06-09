@@ -1842,7 +1842,7 @@ async def get_context_at(
       track_id, track_name, route_id, route_name,
       snap: {lat, lon, distance_to_path_m, progress_km, remaining_km, on_track} | null,
       dimensions: [...],
-      pois_ahead: [{id, name, lat, lon, dimension, knowledge_ids, has_3d,
+      pois_ahead: [{id, name, lat, lon, dimension, knowledge_ids, has_3d_model,
                     distance_along_route_m, distance_euclidean_m, approaching, at_poi}],  # nearest-first
       screen_points_in_view: [ ...same shape... ],  # visual markers within radius_screen_m
       story_scene_at_position: {story, scene, character, text} | null
@@ -1916,7 +1916,7 @@ async def get_context_at(
         [k for e in (pois_ahead + screen_points_in_view) for k in (e.get("knowledge_ids") or [])]
     )
     for e in (pois_ahead + screen_points_in_view):
-        e["has_3d"] = any(_hd.get(int(k)) for k in (e.get("knowledge_ids") or []) if k is not None)
+        e["has_3d_model"] = any(_hd.get(int(k)) for k in (e.get("knowledge_ids") or []) if k is not None)
 
     return {
         "track_id": track_id,
