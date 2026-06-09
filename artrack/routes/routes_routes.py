@@ -1795,8 +1795,8 @@ async def get_context_at(
       track_id, track_name, route_id, route_name,
       snap: {lat, lon, distance_to_path_m, progress_km, remaining_km, on_track} | null,
       dimensions: [...],
-      pois_ahead: [{id, name, dimension, distance_along_route_m, distance_euclidean_m,
-                    approaching, at_poi}],          # ahead on route, nearest-first
+      pois_ahead: [{id, name, lat, lon, dimension, knowledge_ids, distance_along_route_m,
+                    distance_euclidean_m, approaching, at_poi}],  # ahead on route, nearest-first
       screen_points_in_view: [ ...same shape... ],  # visual markers within radius_screen_m
       story_scene_at_position: {story, scene, character, text} | null
     }
@@ -1836,7 +1836,13 @@ async def get_context_at(
         return {
             "id": p["id"],
             "name": p["name"],
+            # Verified GPS position of the POI/screen_point. Without this the guide
+            # bot has no authoritative topic coordinates and may hallucinate them —
+            # it must use these (or null), never approximate from the user position.
+            "lat": p.get("lat"),
+            "lon": p.get("lng"),
             "dimension": p.get("dimension"),
+            "knowledge_ids": p.get("knowledge_ids") or [],
             "distance_along_route_m": round(along - user_along, 1) if (along is not None and user_along is not None) else None,
             "distance_euclidean_m": p.get("distance_m"),
             "approaching": knowledge.get("approaching"),
