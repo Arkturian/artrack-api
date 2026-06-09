@@ -1363,6 +1363,15 @@ async def get_pois_near(
             "subcategory": meta.get("subcategory"),
             "route_id": user_route_id,
             "dimension": meta.get("dimension_slug"),
+            # Curated link(s) to rich Knowledge items (flora/fauna steckbriefe etc.).
+            # Normalized to a list: canonical knowledge_ids[] preferred, scalar
+            # knowledge_id as fallback. A screen_point with this set is a
+            # "Knowledgepoint" (rendered in its own pretty section).
+            "knowledge_ids": (
+                meta["knowledge_ids"]
+                if isinstance(meta.get("knowledge_ids"), list) and meta.get("knowledge_ids")
+                else ([meta["knowledge_id"]] if meta.get("knowledge_id") is not None else [])
+            ),
         }
 
         if include_text:
@@ -1715,14 +1724,40 @@ async def get_pois_near_pretty(
     lines.append("")
 
     # ── Screen Points ──
+    # Split into two sections: a screen_point with a curated knowledge_id link is
+    # semantically a "Knowledgepoint" (rich Knowledge item: description, facts,
+    # 2D-pin annotations) and deserves its own section so the guide bot can
+    # surface knowledge_id and trigger the frontend KnowledgeView. A plain
+    # screen_point (no link) stays a media marker.
     screen_pts = data.get("screen_points", {})
     sp_list = screen_pts.get("points", [])
     if sp_list:
-        lines.append(f"## Screen Points / Media ({screen_pts.get('count', 0)})")
-        for sp in sp_list:
-            ahead = "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
-            lines.append(f"- {ahead} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, type={sp.get('type')})")
-        lines.append("")
+        knowledge_pts = [sp for sp in sp_list if sp.get("knowledge_ids")]
+        plain_pts = [sp for sp in sp_list if not sp.get("knowledge_ids")]
+
+        def _ahead_glyph(sp):
+            return "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
+
+        if knowledge_pts:
+            lines.append(f"## Knowledgepoints ({len(knowledge_pts)})")
+            for sp in knowledge_pts:
+                kids = sp.get("knowledge_ids") or []
+                kid_str = (
+                    f"knowledge_id={kids[0]}" if len(kids) == 1
+                    else "knowledge_ids=" + ",".join(str(k) for k in kids)
+                )
+                lines.append(
+                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, {kid_str})"
+                )
+            lines.append("")
+
+        if plain_pts:
+            lines.append(f"## Screen Points / Media ({len(plain_pts)})")
+            for sp in plain_pts:
+                lines.append(
+                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, type={sp.get('type')})"
+                )
+            lines.append("")
 
     return "\n".join(lines)
 
