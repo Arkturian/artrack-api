@@ -13,6 +13,49 @@ from ..asset_urls import enrich_asset, resolve_audio_url
 from pydantic import BaseModel
 from .track_report_generator import generate_track_report
 
+# ── has_3d lookup (Knowledge bulk endpoint, shared across pretty + context-at) ──
+# A Knowledgepoint whose linked knowledge item has a GLB 3D-model gets a `3d=yes`
+# marker (pretty) / `has_3d: true` field (context-at) so the guide bot can favour
+# 3D-capable POIs without N extra knowledge_get calls. Single bulk call per
+# cache-miss, in-process TTL cache keyed by knowledge_id, best-effort: any error
+# → empty result → no marker, never fails the response (hot-path-safe).
+import os as _os
+_HAS3D_CACHE: dict = {}            # knowledge_id(int) -> (expiry_epoch, bool)
+_HAS3D_TTL = 900.0                  # 15 min
+_KNOWLEDGE_API_BASE = _os.getenv("ARTRACK_KNOWLEDGE_API_BASE", "https://knowledge-api.arkturian.com")
+
+
+async def _get_has_3d(knowledge_ids) -> dict:
+    """Return {knowledge_id:int -> has_3d:bool} for the given ids. TTL-cached,
+    one bulk POST per cache-miss set, best-effort (returns partial/empty on error)."""
+    ids = {int(k) for k in (knowledge_ids or []) if k is not None}
+    if not ids:
+        return {}
+    now = time.time()
+    out, miss = {}, []
+    for kid in ids:
+        ent = _HAS3D_CACHE.get(kid)
+        if ent and ent[0] > now:
+            out[kid] = ent[1]
+        else:
+            miss.append(kid)
+    if miss:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=2.5) as client:
+                r = await client.post(
+                    f"{_KNOWLEDGE_API_BASE}/api/v1/knowledge/has_3d", json={"ids": miss}
+                )
+                r.raise_for_status()
+                data = r.json() or {}
+            for kid in miss:
+                val = bool(data.get(str(kid), data.get(kid, False)))
+                _HAS3D_CACHE[kid] = (now + _HAS3D_TTL, val)
+                out[kid] = val
+        except Exception:
+            pass  # graceful: misses simply absent → no marker, response never fails
+    return out
+
 router = APIRouter()
 
 # Helper function to calculate distance
@@ -1745,6 +1788,9 @@ async def get_pois_near_pretty(
             return "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
 
         if knowledge_pts:
+            _hd = await _get_has_3d(
+                [k for sp in knowledge_pts for k in (sp.get("knowledge_ids") or [])]
+            )
             lines.append(f"## Knowledgepoints ({len(knowledge_pts)})")
             for sp in knowledge_pts:
                 kids = sp.get("knowledge_ids") or []
@@ -1752,8 +1798,9 @@ async def get_pois_near_pretty(
                     f"knowledge_id={kids[0]}" if len(kids) == 1
                     else "knowledge_ids=" + ",".join(str(k) for k in kids)
                 )
+                td = ", 3d=yes" if any(_hd.get(int(k)) for k in kids if k is not None) else ""
                 lines.append(
-                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, {kid_str}{_gps(sp)})"
+                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, {kid_str}{_gps(sp)}{td})"
                 )
             lines.append("")
 
@@ -1795,8 +1842,8 @@ async def get_context_at(
       track_id, track_name, route_id, route_name,
       snap: {lat, lon, distance_to_path_m, progress_km, remaining_km, on_track} | null,
       dimensions: [...],
-      pois_ahead: [{id, name, lat, lon, dimension, knowledge_ids, distance_along_route_m,
-                    distance_euclidean_m, approaching, at_poi}],  # ahead on route, nearest-first
+      pois_ahead: [{id, name, lat, lon, dimension, knowledge_ids, has_3d,
+                    distance_along_route_m, distance_euclidean_m, approaching, at_poi}],  # nearest-first
       screen_points_in_view: [ ...same shape... ],  # visual markers within radius_screen_m
       story_scene_at_position: {story, scene, character, text} | null
     }
@@ -1862,6 +1909,14 @@ async def get_context_at(
         _shape(p) for p in data.get("screen_points", {}).get("points", [])
         if p.get("distance_m") is None or p["distance_m"] <= body.radius_screen_m
     ]
+
+    # has_3d per entry (true if a linked knowledge item carries a GLB) — one bulk
+    # lookup, shared TTL cache. Lets the bot favour 3D-capable POIs without N calls.
+    _hd = await _get_has_3d(
+        [k for e in (pois_ahead + screen_points_in_view) for k in (e.get("knowledge_ids") or [])]
+    )
+    for e in (pois_ahead + screen_points_in_view):
+        e["has_3d"] = any(_hd.get(int(k)) for k in (e.get("knowledge_ids") or []) if k is not None)
 
     return {
         "track_id": track_id,
