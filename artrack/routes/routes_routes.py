@@ -1628,6 +1628,12 @@ async def get_pois_near_pretty(
     )
 
     lines = []
+
+    def _gps(p):
+        """`, gps=<lat>,<lon>` suffix for a POI/point dict, or '' if missing."""
+        la, lo = p.get("lat"), p.get("lng")
+        return f", gps={la:.6f},{lo:.6f}" if la is not None and lo is not None else ""
+
     lines.append(f"# {data['track_name']} (track {track_id})")
     lines.append(f"User position: {lat:.5f}, {lng:.5f} (radius {radius_m}m)")
     lines.append("")
@@ -1678,7 +1684,7 @@ async def get_pois_near_pretty(
         ahead = "→" if p.get("ahead") else ("←" if p.get("ahead") == False else "·")
         cat = f"{p.get('category')}/{p.get('subcategory')}" if p.get('subcategory') else p.get('category', '')
         dim_tag = f" [dimension={p['dimension']}]" if p.get("dimension") else ""
-        lines.append(f"\n### {ahead} {p['name']} (#{p['id']}, {p['distance_m']}m, {cat}){dim_tag}")
+        lines.append(f"\n### {ahead} {p['name']} (#{p['id']}, {p['distance_m']}m, {cat}{_gps(p)}){dim_tag}")
         k = p.get("knowledge", {})
         if k.get("approaching"):
             lines.append(f"  approaching: {k['approaching']}")
@@ -1710,7 +1716,7 @@ async def get_pois_near_pretty(
         lines.append("- No story points in range")
     for sp in story_pts:
         ahead = "→" if sp.get("ahead") else ("←" if sp.get("ahead") == False else "·")
-        lines.append(f"\n### {ahead} {sp['name']} (#{sp['id']}, {sp['distance_m']}m)")
+        lines.append(f"\n### {ahead} {sp['name']} (#{sp['id']}, {sp['distance_m']}m{_gps(sp)})")
         stories = sp.get("stories") or []
         for s in stories:
             char = s.get("character", "?")
@@ -1747,7 +1753,7 @@ async def get_pois_near_pretty(
                     else "knowledge_ids=" + ",".join(str(k) for k in kids)
                 )
                 lines.append(
-                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, {kid_str})"
+                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, {kid_str}{_gps(sp)})"
                 )
             lines.append("")
 
@@ -1755,7 +1761,7 @@ async def get_pois_near_pretty(
             lines.append(f"## Screen Points / Media ({len(plain_pts)})")
             for sp in plain_pts:
                 lines.append(
-                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, type={sp.get('type')})"
+                    f"- {_ahead_glyph(sp)} {sp['name']} (#{sp['id']}, {sp['distance_m']}m, type={sp.get('type')}{_gps(sp)})"
                 )
             lines.append("")
 
