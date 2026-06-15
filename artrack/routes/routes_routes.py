@@ -1349,10 +1349,14 @@ async def get_pois_near(
             user_route_id = None
             user_along = None
 
-    # 3. Get all POIs (manual waypoints + story_points etc., not gps_track)
+    # 3. Get all POIs (manual waypoints + story_points etc., not gps_track).
+    # narration_point excluded too: it's auto-generated guide corpus (Output),
+    # serving it back here would create an Output->Input loop. The corpus is
+    # read via /waypoints/detail (which keeps all types), not the guide path.
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type != "gps_track"
+        Waypoint.waypoint_type != "gps_track",
+        Waypoint.waypoint_type != "narration_point"
     ).all()
 
     # 4. For each POI: calculate distance, snap to route, filter
