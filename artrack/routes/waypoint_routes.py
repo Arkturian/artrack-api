@@ -1117,3 +1117,54 @@ async def bulk_delete_waypoints(
         deleted += 1
     db.commit()
     return {"deleted": deleted}
+
+@router.delete("/tracks/{track_id}/waypoints/by-generation/{generation_id}")
+async def delete_waypoints_by_generation(
+    track_id: int,
+    generation_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Wipe a whole narration-corpus generation (Phase B).
+
+    Deletes all narration_point waypoints of the given generation_id on the track
+    (+ their MediaFile rows). Scoped STRICTLY to waypoint_type=='narration_point',
+    so it can never touch curated POIs/screen_points. Returns the freed TTS
+    audio_storage_ids so the caller sees what is now unreferenced. The audio
+    storage objects are not hard-deleted here yet (narration audio is a follow-up;
+    audio_storage_id is null today) — the storage-delete of freed audios gets
+    wired + verified once TTS audios exist (Alex: audio-mitlöschen = JA).
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    targets = [
+        wp for wp in db.query(Waypoint).filter(
+            Waypoint.track_id == track_id,
+            Waypoint.waypoint_type == "narration_point",
+        ).all()
+        if str((wp.metadata_json or {}).get("generation_id")) == str(generation_id)
+    ]
+    freed_audio = []
+    deleted = 0
+    for wp in targets:
+        aid = (wp.metadata_json or {}).get("audio_storage_id")
+        if aid is not None:
+            freed_audio.append(aid)
+        db.query(MediaFile).filter(MediaFile.waypoint_id == wp.id).delete()
+        db.delete(wp)
+        deleted += 1
+    db.commit()
+    logging.getLogger("artrack.narration").info(
+        "by-generation wipe track=%s gen=%s deleted=%s freed_audio=%s",
+        track_id, generation_id, deleted, freed_audio,
+    )
+    return {
+        "track_id": track_id,
+        "generation_id": generation_id,
+        "deleted": deleted,
+        "freed_audio_storage_ids": freed_audio,
+    }
