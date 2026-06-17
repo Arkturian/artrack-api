@@ -251,6 +251,55 @@ async def list_waypoints_detail(
         ))
     return result
 
+@router.get("/tracks/{track_id}/narration-points")
+async def list_narration_points(
+    track_id: int,
+    generation_id: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read the narration corpus for a track (Phase-2 consumer read path).
+
+    narration_point waypoints are excluded from the bot-facing selector
+    (get_pois_near -> pois-near/context-at/pretty) to avoid an Output->Input
+    loop, so the corpus is read HERE instead. Server-side filtered by type
+    (+ optional generation_id) and sorted by order_id — no pagination over the
+    full waypoint set (which is why a plain waypoints/detail?limit=N can miss
+    high-id narration_points on a large track).
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if not _is_admin(current_user):
+        if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    wps = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.waypoint_type == "narration_point",
+    ).all()
+    out = []
+    for wp in wps:
+        meta = wp.metadata_json or {}
+        if generation_id is not None and str(meta.get("generation_id")) != str(generation_id):
+            continue
+        out.append({
+            "id": wp.id,
+            "lat": wp.latitude,
+            "lon": wp.longitude,
+            "order_id": meta.get("order_id"),
+            "generation_id": meta.get("generation_id"),
+            "text": meta.get("text"),
+            "title": meta.get("title"),
+            "subtitle": meta.get("subtitle"),
+            "narrator": meta.get("narrator"),
+            "audio_storage_id": meta.get("audio_storage_id"),
+            "recorded_at": wp.recorded_at,
+            "metadata_json": enrich_assets_in_metadata(meta),
+        })
+    out.sort(key=lambda x: x["order_id"] if isinstance(x.get("order_id"), (int, float)) else float("inf"))
+    return {"track_id": track_id, "generation_id": generation_id, "count": len(out), "narration_points": out}
+
 @router.post("/upload/{session_id}/complete")
 async def complete_upload_session(
     session_id: str,
