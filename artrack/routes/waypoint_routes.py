@@ -278,10 +278,17 @@ async def list_narration_points(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type == "narration_point",
     ).all()
+    # No generation_id given → default to the LATEST generation (most recently
+    # persisted; waypoint id is monotonic with insertion order), so the frontend
+    # gets one coherent corpus instead of all generations overlaid.
+    effective_gen = generation_id
+    if effective_gen is None and wps:
+        latest_wp = max(wps, key=lambda w: w.id)
+        effective_gen = (latest_wp.metadata_json or {}).get("generation_id")
     out = []
     for wp in wps:
         meta = wp.metadata_json or {}
-        if generation_id is not None and str(meta.get("generation_id")) != str(generation_id):
+        if effective_gen is not None and str(meta.get("generation_id")) != str(effective_gen):
             continue
         out.append({
             "id": wp.id,
@@ -298,7 +305,43 @@ async def list_narration_points(
             "metadata_json": enrich_assets_in_metadata(meta),
         })
     out.sort(key=lambda x: x["order_id"] if isinstance(x.get("order_id"), (int, float)) else float("inf"))
-    return {"track_id": track_id, "generation_id": generation_id, "count": len(out), "narration_points": out}
+    return {"track_id": track_id, "generation_id": effective_gen, "is_latest": generation_id is None, "count": len(out), "narration_points": out}
+
+
+@router.get("/tracks/{track_id}/narration-generations")
+async def list_narration_generations(
+    track_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the narration-corpus generations of a track (review/tooling).
+
+    Returns one entry per generation_id with count + latest waypoint id/time,
+    sorted newest-first. Lets a UI pick a generation without scanning all points.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if not _is_admin(current_user):
+        if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    wps = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.waypoint_type == "narration_point",
+    ).all()
+    gens: dict = {}
+    for wp in wps:
+        g = (wp.metadata_json or {}).get("generation_id")
+        if g is None:
+            continue
+        e = gens.setdefault(str(g), {"generation_id": str(g), "count": 0, "latest_id": 0, "latest_recorded_at": None})
+        e["count"] += 1
+        if wp.id > e["latest_id"]:
+            e["latest_id"] = wp.id
+            e["latest_recorded_at"] = wp.recorded_at
+    out = sorted(gens.values(), key=lambda x: x["latest_id"], reverse=True)
+    return {"track_id": track_id, "count": len(out), "generations": out}
 
 @router.post("/upload/{session_id}/complete")
 async def complete_upload_session(
