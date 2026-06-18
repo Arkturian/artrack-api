@@ -244,6 +244,27 @@ SEGMENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
 
 
 # =============================================================================
+# Farb-Kategorien (coarse color layer, orthogonal to the fine POI taxonomy)
+# =============================================================================
+# A small, user-facing color scheme set per waypoint via metadata_json.farbkategorie
+# (slug). It is an ADDITIONAL axis on top of the fine `category`/`subcategory`
+# taxonomy above (which still drives icon/radius/priority) — not a replacement.
+# Single source of truth: consumers (dashboard swatch picker, tschepp-ar mock,
+# map renderer) read the slug and resolve the color from here, instead of
+# hard-coding a color mapping. Canonical key is the slug; `color` cached on the
+# waypoint is only a convenience mirror of farbe.
+
+FARB_KATEGORIEN: Dict[str, Dict[str, str]] = {
+    "wegbeschreibung": {"bezeichnung": "Wegbeschreibung", "farbe": "#E0554B"},
+    "gasthaus":        {"bezeichnung": "Gasthaus",        "farbe": "#E8923A"},
+    "attraktion":      {"bezeichnung": "Attraktion",      "farbe": "#EAC54A"},
+    "flora_fauna":     {"bezeichnung": "Flora & Fauna",   "farbe": "#5DA85E"},
+    "wasser":          {"bezeichnung": "Wasser",          "farbe": "#4A9BD4"},
+    "ar_qr":           {"bezeichnung": "AR/QR-Punkt",     "farbe": "#9B6BD6"},
+}
+
+
+# =============================================================================
 # Response Models
 # =============================================================================
 
@@ -338,3 +359,14 @@ async def get_poi_categories():
 async def get_segment_categories():
     """Get only Segment categories."""
     return SEGMENT_CATEGORIES
+
+
+@router.get("/farb-kategorien")
+async def get_farb_kategorien():
+    """Get the coarse color-category scheme (single source of truth).
+
+    Returns a dict keyed by slug -> {bezeichnung, farbe}. Consumers resolve a
+    waypoint's pin/badge color from metadata_json.farbkategorie via this map,
+    rather than hard-coding colors. Orthogonal to the fine POI categories.
+    """
+    return FARB_KATEGORIEN
