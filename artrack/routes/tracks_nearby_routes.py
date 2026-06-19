@@ -42,6 +42,27 @@ from .snap_routes import _closest_point_across_polylines
 router = APIRouter()
 
 
+@router.get("/world")
+def get_world_track(db: Session = Depends(get_db)):
+    """Resolve the singleton World track (the global fallback corpus track).
+
+    Clients call this instead of hard-coding the track id, so the same client
+    works across dev/prod where the id may differ. Canonical marker is
+    ``metadata_json.is_world == true`` (track_type == "world" is the semantic
+    secondary key). Registered before ``/{track_id}`` so the literal path wins.
+    """
+    world = db.query(Track).filter(Track.track_type == "world").order_by(Track.id).first()
+    if not world or not (world.metadata_json or {}).get("is_world"):
+        raise HTTPException(status_code=404, detail="World track not configured")
+    return {
+        "id": world.id,
+        "name": world.name,
+        "track_type": world.track_type,
+        "visibility": world.visibility,
+        "is_world": True,
+    }
+
+
 class NearbyTrack(BaseModel):
     track_id: int
     name: str

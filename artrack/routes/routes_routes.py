@@ -1356,7 +1356,8 @@ async def get_pois_near(
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type != "gps_track",
-        Waypoint.waypoint_type != "narration_point"
+        Waypoint.waypoint_type != "narration_point",
+        Waypoint.waypoint_type != "gps_telemetry"
     ).all()
 
     # 4. For each POI: calculate distance, snap to route, filter
