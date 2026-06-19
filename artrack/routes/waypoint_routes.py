@@ -1013,7 +1013,22 @@ async def update_waypoint(
         meta["tags"] = update.tags
     # Merge metadata_json if provided (deep merge for nested objects like segment)
     if update.metadata_json is not None:
-        for key, value in update.metadata_json.items():
+        incoming = dict(update.metadata_json)
+        # Defensive: preserve each asset's storage_host across an assets-list
+        # replacement. Clients (dashboard editor, MCP waypoint_update) frequently
+        # resend assets as {id, role} WITHOUT the host marker; without this carry-
+        # over the merge would strip storage_host and migrated (arkserver) assets
+        # would 404 again. Match by id and only fill when the incoming entry omits it.
+        if isinstance(incoming.get("assets"), list):
+            old_hosts = {
+                a["id"]: a["storage_host"]
+                for a in (meta.get("assets") or [])
+                if isinstance(a, dict) and a.get("id") is not None and a.get("storage_host")
+            }
+            for a in incoming["assets"]:
+                if isinstance(a, dict) and a.get("id") in old_hosts and not a.get("storage_host"):
+                    a["storage_host"] = old_hosts[a["id"]]
+        for key, value in incoming.items():
             if isinstance(value, dict) and isinstance(meta.get(key), dict):
                 # Deep merge for nested dicts (e.g., segment, snap)
                 meta[key] = {**meta[key], **value}
