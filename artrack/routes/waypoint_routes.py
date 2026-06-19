@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Header, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Header, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 import logging
 from sqlalchemy.orm import Session
@@ -289,6 +289,7 @@ async def list_waypoints_detail(
 async def list_narration_points(
     track_id: int,
     generation_id: str | None = None,
+    all_generations: bool = Query(False, alias="all"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -300,6 +301,16 @@ async def list_narration_points(
     (+ optional generation_id) and sorted by order_id — no pagination over the
     full waypoint set (which is why a plain waypoints/detail?limit=N can miss
     high-id narration_points on a large track).
+
+    Read modes:
+    - no params  → LATEST generation only (one coherent corpus; right for a
+      single sim-run track like Track 30).
+    - ?generation_id=<id> → exactly that batch.
+    - ?all=true  (or ?generation_id=all) → the FULL accumulated corpus across
+      ALL generations, sorted chronologically (insertion order). Needed for the
+      World track, which accumulates narrations over many sessions — latest-only
+      would truncate it. Per-batch generation_id is preserved either way, so the
+      by-generation wipe can still drop a single bad batch selectively.
     """
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
@@ -312,11 +323,13 @@ async def list_narration_points(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type == "narration_point",
     ).all()
-    # No generation_id given → default to the LATEST generation (most recently
-    # persisted; waypoint id is monotonic with insertion order), so the frontend
-    # gets one coherent corpus instead of all generations overlaid.
-    effective_gen = generation_id
-    if effective_gen is None and wps:
+    # all-mode: return every generation (accumulating corpus). Also accept the
+    # sentinel generation_id="all" for callers that route through the gen param.
+    want_all = all_generations or (generation_id is not None and str(generation_id).lower() == "all")
+    # No generation_id given (and not all) → default to the LATEST generation
+    # (most recently persisted; waypoint id is monotonic with insertion order).
+    effective_gen = None if want_all else generation_id
+    if not want_all and effective_gen is None and wps:
         latest_wp = max(wps, key=lambda w: w.id)
         effective_gen = (latest_wp.metadata_json or {}).get("generation_id")
     out = []
@@ -338,8 +351,12 @@ async def list_narration_points(
             "recorded_at": wp.recorded_at,
             "metadata_json": enrich_assets_in_metadata(meta),
         })
-    out.sort(key=lambda x: x["order_id"] if isinstance(x.get("order_id"), (int, float)) else float("inf"))
-    return {"track_id": track_id, "generation_id": effective_gen, "is_latest": generation_id is None, "count": len(out), "narration_points": out}
+    if want_all:
+        # chronological across generations (each batch persisted in order_id order)
+        out.sort(key=lambda x: x["id"])
+    else:
+        out.sort(key=lambda x: x["order_id"] if isinstance(x.get("order_id"), (int, float)) else float("inf"))
+    return {"track_id": track_id, "generation_id": (None if want_all else effective_gen), "all": want_all, "is_latest": (not want_all and generation_id is None), "count": len(out), "narration_points": out}
 
 
 @router.get("/tracks/{track_id}/narration-generations")
