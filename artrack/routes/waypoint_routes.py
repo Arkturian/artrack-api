@@ -32,6 +32,40 @@ import sqlite3
 router = APIRouter()
 logger = logging.getLogger("artrack.waypoints")
 
+# --- Per-asset storage host auto-resolution -------------------------------
+# Some assets live ONLY on the alternate (arkserver) storage and are NOT in this
+# service's storage_objects mirror, so we cannot resolve their host from the DB.
+# When a client attaches such an asset without a storage_host marker, enrichment
+# would fall back to the default (arkturian) host and 404. As a best-effort, we
+# HEAD-probe the alternate host once (cached) so consumers don't have to know
+# where an asset lives. Graceful: any failure → no stamp → default behavior.
+import time as _time
+_ASSET_HOST_CACHE: dict = {}            # asset_id(int) -> (expiry_epoch, host_or_None)
+_ASSET_HOST_TTL = 600                    # 10 min
+_STORAGE_ALT_HOST = os.getenv("ARTRACK_STORAGE_ALT_HOST", "https://api-storage.arkserver.arkturian.com")
+
+async def _resolve_asset_host(asset_id: int) -> Optional[str]:
+    """Return the alternate storage host if the asset is served there (HTTP 200),
+    else None. Cached with a TTL; never raises."""
+    try:
+        now = _time.time()
+        ent = _ASSET_HOST_CACHE.get(asset_id)
+        if ent and ent[0] > now:
+            return ent[1]
+        host = None
+        try:
+            url = f"{_STORAGE_ALT_HOST}/storage/media/{asset_id}?variant=thumbnail&format=jpg"
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.head(url)
+                if r.status_code == 200:
+                    host = _STORAGE_ALT_HOST
+        except Exception:
+            host = None
+        _ASSET_HOST_CACHE[asset_id] = (now + _ASSET_HOST_TTL, host)
+        return host
+    except Exception:
+        return None
+
 def _is_admin(user: "User") -> bool:
     try:
         return getattr(user, "trust_level", None) in ("admin", "moderator")
@@ -1028,6 +1062,16 @@ async def update_waypoint(
             for a in incoming["assets"]:
                 if isinstance(a, dict) and a.get("id") in old_hosts and not a.get("storage_host"):
                     a["storage_host"] = old_hosts[a["id"]]
+            # Genuinely new asset with no host and no prior record → best-effort
+            # probe the alternate (arkserver) host so consumers needn't know it.
+            for a in incoming["assets"]:
+                if isinstance(a, dict) and a.get("id") is not None and not a.get("storage_host"):
+                    try:
+                        resolved = await _resolve_asset_host(int(a["id"]))
+                    except Exception:
+                        resolved = None
+                    if resolved:
+                        a["storage_host"] = resolved
         for key, value in incoming.items():
             if isinstance(value, dict) and isinstance(meta.get(key), dict):
                 # Deep merge for nested dicts (e.g., segment, snap)
