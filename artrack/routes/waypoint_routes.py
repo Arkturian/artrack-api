@@ -338,7 +338,16 @@ async def list_narration_points(
     geo_mode = near_lat is not None and near_lon is not None
     # all-mode: every generation (accumulating corpus). geo-near implies all-gens
     # (search the whole corpus in radius). Sentinel generation_id="all" also works.
-    want_all = all_generations or geo_mode or (generation_id is not None and str(generation_id).lower() == "all")
+    # An image_status filter WITHOUT an explicit generation_id also implies all-gens:
+    # status filtering means "all approved/provisional/rejected across the corpus"
+    # (Stufe-2 backstop, frontend gallery) — scoping it to just the latest generation
+    # would silently miss points in older generations on an accumulating track.
+    want_all = (
+        all_generations
+        or geo_mode
+        or (image_status is not None and generation_id is None)
+        or (generation_id is not None and str(generation_id).lower() == "all")
+    )
     # No generation_id (and not all/geo) → default to the LATEST generation
     # (most recently persisted; waypoint id is monotonic with insertion order).
     effective_gen = None if want_all else generation_id
