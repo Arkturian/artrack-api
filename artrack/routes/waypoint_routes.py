@@ -20,6 +20,7 @@ from ..models import (
 )
 from ..auth import get_current_user
 from ..asset_urls import enrich_assets_in_metadata
+from ..services.track_bbox import _haversine_m
 from artrack.storage_domain import save_file_and_record
 from clients.storage_client import generic_storage, enqueue_ai_safety_and_transcoding
 from ..analysis import analysis_service
@@ -290,6 +291,9 @@ async def list_narration_points(
     track_id: int,
     generation_id: str | None = None,
     all_generations: bool = Query(False, alias="all"),
+    near: str | None = Query(None, description="geo filter 'lat,lon' — returns points within radius_m, sorted by distance"),
+    radius_m: float | None = None,
+    image_status: str | None = Query(None, description="filter by metadata_json.image_status: provisional|approved|rejected"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -323,10 +327,19 @@ async def list_narration_points(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type == "narration_point",
     ).all()
-    # all-mode: return every generation (accumulating corpus). Also accept the
-    # sentinel generation_id="all" for callers that route through the gen param.
-    want_all = all_generations or (generation_id is not None and str(generation_id).lower() == "all")
-    # No generation_id given (and not all) → default to the LATEST generation
+    # geo-near: parse "lat,lon" → distance filter (replaces interactions/nearby).
+    near_lat = near_lon = None
+    if near:
+        try:
+            _p = near.split(",")
+            near_lat = float(_p[0].strip()); near_lon = float(_p[1].strip())
+        except Exception:
+            raise HTTPException(status_code=422, detail="near must be 'lat,lon'")
+    geo_mode = near_lat is not None and near_lon is not None
+    # all-mode: every generation (accumulating corpus). geo-near implies all-gens
+    # (search the whole corpus in radius). Sentinel generation_id="all" also works.
+    want_all = all_generations or geo_mode or (generation_id is not None and str(generation_id).lower() == "all")
+    # No generation_id (and not all/geo) → default to the LATEST generation
     # (most recently persisted; waypoint id is monotonic with insertion order).
     effective_gen = None if want_all else generation_id
     if not want_all and effective_gen is None and wps:
@@ -337,7 +350,14 @@ async def list_narration_points(
         meta = wp.metadata_json or {}
         if effective_gen is not None and str(meta.get("generation_id")) != str(effective_gen):
             continue
-        out.append({
+        if image_status is not None and str(meta.get("image_status") or "") != image_status:
+            continue
+        dist = None
+        if geo_mode:
+            dist = _haversine_m(near_lat, near_lon, wp.latitude, wp.longitude)
+            if radius_m is not None and dist > radius_m:
+                continue
+        rec = {
             "id": wp.id,
             "lat": wp.latitude,
             "lon": wp.longitude,
@@ -348,15 +368,31 @@ async def list_narration_points(
             "subtitle": meta.get("subtitle"),
             "narrator": meta.get("narrator"),
             "audio_storage_id": meta.get("audio_storage_id"),
+            "image_status": meta.get("image_status"),
             "recorded_at": wp.recorded_at,
             "metadata_json": enrich_assets_in_metadata(meta),
-        })
-    if want_all:
+        }
+        if dist is not None:
+            rec["distance_m"] = round(dist, 1)
+        out.append(rec)
+    if geo_mode:
+        out.sort(key=lambda x: x.get("distance_m") if x.get("distance_m") is not None else float("inf"))
+    elif want_all:
         # chronological across generations (each batch persisted in order_id order)
         out.sort(key=lambda x: x["id"])
     else:
         out.sort(key=lambda x: x["order_id"] if isinstance(x.get("order_id"), (int, float)) else float("inf"))
-    return {"track_id": track_id, "generation_id": (None if want_all else effective_gen), "all": want_all, "is_latest": (not want_all and generation_id is None), "count": len(out), "narration_points": out}
+    return {
+        "track_id": track_id,
+        "generation_id": (None if want_all else effective_gen),
+        "all": want_all,
+        "is_latest": (not want_all and generation_id is None),
+        "near": ([near_lat, near_lon] if geo_mode else None),
+        "radius_m": radius_m if geo_mode else None,
+        "image_status": image_status,
+        "count": len(out),
+        "narration_points": out,
+    }
 
 
 @router.get("/tracks/{track_id}/narration-generations")
