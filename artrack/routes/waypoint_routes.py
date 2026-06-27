@@ -383,6 +383,8 @@ async def list_narration_points(
         }
         if dist is not None:
             rec["distance_m"] = round(dist, 1)
+        if isinstance(meta.get("settings"), dict) and meta.get("settings"):
+            rec["settings"] = meta["settings"]
         out.append(rec)
     if geo_mode:
         out.sort(key=lambda x: x.get("distance_m") if x.get("distance_m") is not None else float("inf"))
@@ -1082,6 +1084,50 @@ async def get_waypoint_detail(
         media=media
     )
 
+# --- Per-POI generic settings (metadata_json.settings) ----------------------
+# Consuming apps (tschepp-ar etc.) read a generic per-POI settings block for
+# display/behaviour. Hybrid namespace: shared `display`/`audio`/`ar` blocks +
+# optional per-app overrides under `apps.<app>` (app-specific overrides shared,
+# merge applied consumer-side). Iteration 1: display.{pin_style,priority,
+# featured,enabled,min_zoom}. metadata_json is free JSON → no migration.
+_SETTINGS_PIN_STYLES = {"balloon", "teardrop", "card", "spotlight"}
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """Recursively merge patch into a copy of base. Nested dicts merge key-by-key
+    (so updating settings.display.pin_style preserves settings.display.priority);
+    non-dict values replace. Needed because the generic metadata merge is only
+    one level deep and would clobber sibling settings on a partial update."""
+    out = dict(base or {})
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+def _validate_settings(settings) -> None:
+    """Validate the parts of a settings patch that have a fixed contract.
+    Only pin_style is enum-constrained; everything else is free-form. Checks both
+    the shared display block and any per-app override. Raises 400 on a bad value."""
+    if not isinstance(settings, dict):
+        return
+    blocks = []
+    if isinstance(settings.get("display"), dict):
+        blocks.append(settings["display"])
+    apps = settings.get("apps")
+    if isinstance(apps, dict):
+        for app_cfg in apps.values():
+            if isinstance(app_cfg, dict) and isinstance(app_cfg.get("display"), dict):
+                blocks.append(app_cfg["display"])
+    for blk in blocks:
+        ps = blk.get("pin_style")
+        if ps is not None and ps not in _SETTINGS_PIN_STYLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid display.pin_style '{ps}' — allowed: {sorted(_SETTINGS_PIN_STYLES)} or null",
+            )
+
+
 # Update a waypoint's user_description and metadata
 @router.put("/waypoints/{waypoint_id}")
 async def update_waypoint(
@@ -1134,8 +1180,15 @@ async def update_waypoint(
                         resolved = None
                     if resolved:
                         a["storage_host"] = resolved
+        # Validate the settings patch (pin_style enum) before merging.
+        if "settings" in incoming:
+            _validate_settings(incoming.get("settings"))
         for key, value in incoming.items():
-            if isinstance(value, dict) and isinstance(meta.get(key), dict):
+            if key == "settings" and isinstance(value, dict) and isinstance(meta.get(key), dict):
+                # Recursive partial-merge so a client can update one nested
+                # settings field without clobbering its siblings.
+                meta[key] = _deep_merge(meta[key], value)
+            elif isinstance(value, dict) and isinstance(meta.get(key), dict):
                 # Deep merge for nested dicts (e.g., segment, snap)
                 meta[key] = {**meta[key], **value}
             else:

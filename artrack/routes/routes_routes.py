@@ -1422,6 +1422,12 @@ async def get_pois_near(
             ),
         }
 
+        # Generic per-POI display/behaviour settings for consuming apps (tschepp-ar
+        # etc.). Pass through 1:1 only when set — no null-spam. Written via
+        # waypoint_update (recursive partial-merge on metadata_json.settings).
+        if isinstance(meta.get("settings"), dict) and meta.get("settings"):
+            poi_data["settings"] = meta["settings"]
+
         if include_text:
             # Knowledge texts (approaching + at_poi)
             approaching = knowledge.get("approaching", {})
@@ -1885,7 +1891,7 @@ async def get_context_at(
         # main asset resolved url (host-correct), else first asset
         assets = p.get("assets") or []
         main = next((a for a in assets if a.get("role") == "main"), assets[0] if assets else None)
-        return {
+        shaped = {
             "id": p["id"],
             "name": p["name"],
             # Verified GPS position of the POI/screen_point. Without this the guide
@@ -1905,6 +1911,9 @@ async def get_context_at(
             "thumbnail_url": main.get("thumbnail_url") if main else None,
             "audio_url": p.get("audio_url"),
         }
+        if p.get("settings"):
+            shaped["settings"] = p["settings"]
+        return shaped
 
     pois_ahead = [
         _shape(p) for p in data.get("pois_ahead", [])
