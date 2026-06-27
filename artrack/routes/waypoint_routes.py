@@ -1105,6 +1105,22 @@ def _deep_merge(base: dict, patch: dict) -> dict:
             out[k] = v
     return out
 
+def _prune_empty(d):
+    """Recursively drop None values + emptied dicts so cleared settings fields
+    don't linger as null-spam (a consumer treats an absent key as 'use default').
+    Lets a client clear a field by sending it as null."""
+    if not isinstance(d, dict):
+        return d
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            pv = _prune_empty(v)
+            if pv:
+                out[k] = pv
+        elif v is not None:
+            out[k] = v
+    return out
+
 def _validate_settings(settings) -> None:
     """Validate the parts of a settings patch that have a fixed contract.
     Only pin_style is enum-constrained; everything else is free-form. Checks both
@@ -1193,6 +1209,13 @@ async def update_waypoint(
                 meta[key] = {**meta[key], **value}
             else:
                 meta[key] = value
+        # Prune null/empty out of settings so cleared fields disappear (no null-spam)
+        if isinstance(meta.get("settings"), dict):
+            pruned = _prune_empty(meta["settings"])
+            if pruned:
+                meta["settings"] = pruned
+            else:
+                meta.pop("settings", None)
     waypoint.metadata_json = meta
     flag_modified(waypoint, "metadata_json")  # Explicitly mark JSON field as modified for SQLAlchemy
 
