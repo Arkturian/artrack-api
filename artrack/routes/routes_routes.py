@@ -1504,6 +1504,15 @@ async def get_pois_near(
             # Host-correct resolved URLs per asset (file_url/thumbnail_url) so
             # clients consume them 1:1 instead of building a storage host.
             poi_data["assets"] = [enrich_asset(a) for a in assets if isinstance(a, dict)]
+            # Convenience: host-resolved video URL for the map balloon (image stays
+            # the marker, video plays on zoom-in). Canonical = an asset with
+            # role="video"; fall back to any asset whose mime_type is video/*.
+            _vid = next((a for a in poi_data["assets"] if a.get("role") == "video"), None) \
+                or next((a for a in poi_data["assets"] if str(a.get("mime_type") or "").startswith("video")), None)
+            if _vid and _vid.get("file_url"):
+                poi_data["video_url"] = _vid["file_url"]
+                if _vid.get("thumbnail_url"):
+                    poi_data["video_poster_url"] = _vid["thumbnail_url"]
 
         pois_with_distance.append(poi_data)
 
@@ -1753,6 +1762,8 @@ async def get_pois_near_pretty(
             or (_assets[0] if _assets else None)
         if _img and _img.get("file_url"):
             lines.append(f"  image: {_img['file_url']}")
+        if p.get("video_url"):
+            lines.append(f"  video: {p['video_url']}")
         # Audio narration URL for this POI (host-resolved) — see audio cues below
         if p.get("audio_url"):
             lines.append(f"  audio: {p['audio_url']}")
@@ -1913,6 +1924,10 @@ async def get_context_at(
         }
         if p.get("settings"):
             shaped["settings"] = p["settings"]
+        if p.get("video_url"):
+            shaped["video_url"] = p["video_url"]
+            if p.get("video_poster_url"):
+                shaped["video_poster_url"] = p["video_poster_url"]
         return shaped
 
     pois_ahead = [
