@@ -9,7 +9,7 @@ import time
 from ..database import get_db
 from ..auth import get_current_user
 from ..models import Track, TrackRoute as TrackRouteModel, Waypoint
-from ..asset_urls import enrich_asset, resolve_audio_url
+from ..asset_urls import enrich_asset, resolve_audio_url, resolve_hls_url
 from pydantic import BaseModel
 from .track_report_generator import generate_track_report
 
@@ -1513,6 +1513,12 @@ async def get_pois_near(
                 poi_data["video_url"] = _vid["file_url"]
                 if _vid.get("thumbnail_url"):
                     poi_data["video_poster_url"] = _vid["thumbnail_url"]
+                # Transcoded HLS manifest (X-HLS-URL), if available — consumer
+                # prefers HLS over mp4. Also set on the asset for direct readers.
+                _hls = await resolve_hls_url(_vid.get("id"), _vid.get("storage_host"))
+                if _hls:
+                    poi_data["video_hls_url"] = _hls
+                    _vid["hls_url"] = _hls
 
         pois_with_distance.append(poi_data)
 
@@ -1928,6 +1934,8 @@ async def get_context_at(
             shaped["video_url"] = p["video_url"]
             if p.get("video_poster_url"):
                 shaped["video_poster_url"] = p["video_poster_url"]
+            if p.get("video_hls_url"):
+                shaped["video_hls_url"] = p["video_hls_url"]
         return shaped
 
     pois_ahead = [

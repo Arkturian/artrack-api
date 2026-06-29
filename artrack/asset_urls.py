@@ -83,3 +83,64 @@ def enrich_assets_in_metadata(metadata: Optional[dict]) -> Optional[dict]:
     out = dict(metadata)
     out["assets"] = new_assets
     return out
+
+
+# --- HLS resolution for video assets ----------------------------------------
+# The storage media endpoint serves the raw mp4 (file_url) AND exposes a
+# transcoded HLS manifest via the ``X-HLS-URL`` response header (when
+# ``X-Transcoding-Status: completed``). The HLS URL is an opaque transcoded path,
+# NOT derivable from the asset id, so we read it from the header. Cached per asset.
+import time as _time
+_HLS_CACHE: dict = {}            # asset_id(int) -> (expiry_epoch, hls_url_or_None)
+_HLS_TTL = 600                    # 10 min
+
+
+async def resolve_hls_url(asset_id: Any, storage_host: Optional[str] = None) -> Optional[str]:
+    """Return the asset's transcoded HLS manifest URL (X-HLS-URL header) if
+    transcoding is completed, else None. Cached with a TTL; never raises."""
+    if asset_id is None:
+        return None
+    try:
+        now = _time.time()
+        ent = _HLS_CACHE.get(asset_id)
+        if ent and ent[0] > now:
+            return ent[1]
+        hls = None
+        try:
+            import httpx
+            host = (storage_host or settings.STORAGE_DEFAULT_HOST).rstrip("/")
+            url = f"{host}/storage/media/{asset_id}"
+            async with httpx.AsyncClient(timeout=2.5) as client:
+                # range GET (cheap) — the X-HLS-URL header rides on the media response
+                r = await client.get(url, headers={"Range": "bytes=0-1"})
+                if str(r.headers.get("x-transcoding-status", "")).lower() == "completed":
+                    h = r.headers.get("x-hls-url")
+                    if h:
+                        hls = h
+        except Exception:
+            hls = None
+        _HLS_CACHE[asset_id] = (now + _HLS_TTL, hls)
+        return hls
+    except Exception:
+        return None
+
+
+async def attach_hls_to_assets(metadata: Optional[dict]) -> Optional[dict]:
+    """In-place: set ``hls_url`` on each video asset (role=='video' or mime
+    video/*) in metadata['assets'] when a transcoded HLS manifest exists. Pass an
+    already-enriched metadata dict (assets carry storage_host/file_url)."""
+    if not isinstance(metadata, dict):
+        return metadata
+    assets = metadata.get("assets")
+    if not isinstance(assets, list):
+        return metadata
+    for a in assets:
+        if not isinstance(a, dict) or a.get("id") is None or a.get("hls_url"):
+            continue
+        is_video = a.get("role") == "video" or str(a.get("mime_type") or "").startswith("video")
+        if not is_video:
+            continue
+        hls = await resolve_hls_url(a["id"], a.get("storage_host"))
+        if hls:
+            a["hls_url"] = hls
+    return metadata
