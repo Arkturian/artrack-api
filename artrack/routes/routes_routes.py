@@ -2464,6 +2464,7 @@ async def set_waypoint_knowledge_links(
 async def get_waypoints_by_knowledge(
     knowledge_id: int,
     track_id: Optional[int] = None,
+    primary_only: bool = False,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
@@ -2496,6 +2497,12 @@ async def get_waypoints_by_knowledge(
         kids = meta.get("knowledge_ids")
         if not isinstance(kids, list):
             kids = [meta["knowledge_id"]] if meta.get("knowledge_id") is not None else []
+        # Sighting cluster role for this species (set by the recluster pass).
+        # Unclustered (no entry) defaults to primary so existing data is never hidden.
+        _kc = (meta.get("knowledge_clusters") or {}).get(str(knowledge_id)) or {}
+        is_primary = bool(_kc.get("is_primary", True))
+        if primary_only and not is_primary:
+            continue
         out.append({
             "id": w.id,
             "track_id": w.track_id,
@@ -2504,8 +2511,10 @@ async def get_waypoints_by_knowledge(
             "waypoint_type": w.waypoint_type,
             "title": meta.get("title"),
             "knowledge_ids": kids,
+            "is_primary": is_primary,
+            "cluster_id": _kc.get("cluster_id"),
             "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
             "source_collection": meta.get("source_collection"),
         })
-    return {"knowledge_id": knowledge_id, "count": len(out), "waypoints": out}
+    return {"knowledge_id": knowledge_id, "count": len(out), "primary_only": primary_only, "waypoints": out}
 

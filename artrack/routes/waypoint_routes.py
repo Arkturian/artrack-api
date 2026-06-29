@@ -1232,6 +1232,93 @@ async def update_waypoint(
 
     return {"message": "Waypoint updated"}
 
+
+# --- Knowledge-sighting clustering (non-destructive primary/secondary marking) ---
+@router.post("/tracks/{track_id}/knowledge/recluster")
+async def recluster_knowledge(
+    track_id: int,
+    radius: float = 50.0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Group nearby sightings of the same knowledge species into clusters and mark
+    one primary per cluster — NON-destructive: writes
+    metadata_json.knowledge_clusters[<knowledge_id>] = {cluster_id, is_primary, locked}
+    and never touches knowledge_ids[] (full sightings preserved; web reads
+    primary_only). Greedy single-pass by waypoint_id within `radius` meters.
+    locked entries keep their assignment. Track-creator/admin/moderator only."""
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if not _is_admin(current_user):
+        if track.created_by != current_user.id and current_user.trust_level not in ("admin", "moderator"):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    wps = db.query(Waypoint).filter(Waypoint.track_id == track_id).all()
+    # group waypoints by each knowledge_id they reference (canonical list + scalar)
+    by_species: dict = {}
+    for w in wps:
+        md = w.metadata_json or {}
+        kids = md.get("knowledge_ids")
+        if not isinstance(kids, list):
+            kids = [md["knowledge_id"]] if md.get("knowledge_id") is not None else []
+        for kid in kids:
+            if w.latitude is None or w.longitude is None:
+                continue
+            by_species.setdefault(str(kid), []).append(w)
+
+    changed = 0
+    clusters_total = 0
+    for kid, sightings in by_species.items():
+        sightings.sort(key=lambda w: w.id)
+        assigned: dict = {}            # wp.id -> (cluster_id, is_primary)
+        unlocked = []
+        locked_cids = []
+        for w in sightings:
+            kc = ((w.metadata_json or {}).get("knowledge_clusters") or {}).get(kid)
+            if kc and kc.get("locked"):
+                assigned[w.id] = (kc.get("cluster_id"), bool(kc.get("is_primary", False)))
+                if isinstance(kc.get("cluster_id"), int):
+                    locked_cids.append(kc["cluster_id"])
+            else:
+                unlocked.append(w)
+        next_cid = (max(locked_cids) + 1) if locked_cids else 1
+        remaining = list(unlocked)
+        while remaining:
+            primary = remaining.pop(0)
+            cid = next_cid; next_cid += 1; clusters_total += 1
+            assigned[primary.id] = (cid, True)
+            still = []
+            for other in remaining:
+                if _haversine_m(primary.latitude, primary.longitude, other.latitude, other.longitude) <= radius:
+                    assigned[other.id] = (cid, False)
+                else:
+                    still.append(other)
+            remaining = still
+        # write back (only when changed)
+        for w in sightings:
+            if w.id not in assigned:
+                continue
+            cid, prim = assigned[w.id]
+            md = dict(w.metadata_json or {})
+            kc_all = dict(md.get("knowledge_clusters") or {})
+            prev = dict(kc_all.get(kid) or {})
+            new = {"cluster_id": cid, "is_primary": bool(prim), "locked": bool(prev.get("locked", False))}
+            if prev != new:
+                kc_all[kid] = new
+                md["knowledge_clusters"] = kc_all
+                w.metadata_json = md
+                flag_modified(w, "metadata_json")
+                changed += 1
+    db.commit()
+    return {
+        "track_id": track_id,
+        "radius_m": radius,
+        "species": len(by_species),
+        "clusters": clusters_total,
+        "waypoints_updated": changed,
+    }
+
 # --- Attach existing storage objects (media) to a waypoint ---
 class StorageAttachRequest(BaseModel):
     storageIds: List[int]
