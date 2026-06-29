@@ -66,9 +66,14 @@ app = FastAPI(
 )
 
 # CORS
+# NOTE: allow_origins=["*"] together with allow_credentials=True is INVALID per the
+# Fetch spec — the browser rejects a wildcard Access-Control-Allow-Origin whenever the
+# request is credentialed (Bearer/Cookie), surfacing as "No 'Access-Control-Allow-Origin'
+# header is present". allow_origin_regex=".*" makes Starlette echo the concrete request
+# origin back instead of "*", which is credential-compatible for every origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
