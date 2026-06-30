@@ -1609,6 +1609,202 @@ async def generate_knowledge_audio(
     }
 
 
+# ============ Cue CRUD ============
+# Granular write access to a narration slot's cues[] — so an already-generated
+# audio asset (e.g. an ElevenLabs MP3 produced out-of-band via /ai/tts/narrate)
+# can be registered as a cue WITHOUT re-running TTS. Complements
+# POST /knowledge/audio (which generates+writes cues itself). All cue data lives
+# in the content-api narration doc at knowledge[<section>][<item_id>][<slot>].cues[];
+# these endpoints read-modify-write that single doc via save_narration_knowledge.
+
+_CUE_VALID_SLOTS = {
+    "poi": ["approaching", "at_poi"],
+    "route": ["intro", "outro"],
+    "segment": ["entry", "exit"],
+}
+_CUE_SECTION_TO_TYPE = {"pois": "poi", "routes": "route", "segments": "segment"}
+_CUE_TYPE_TO_SECTION = {"poi": "pois", "route": "routes", "segment": "segments"}
+
+
+class CueCreate(BaseModel):
+    """Append one cue to a slot. index in the body is ignored (auto-assigned)."""
+    text: str
+    audio_storage_id: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    index: Optional[int] = None  # accepted for symmetry, ignored — cues are appended
+
+
+class CueUpdate(BaseModel):
+    """Partial update of one cue (only provided fields change)."""
+    text: Optional[str] = None
+    audio_storage_id: Optional[int] = None
+    duration_seconds: Optional[float] = None
+
+
+class CueReorder(BaseModel):
+    order: List[int]  # a permutation of the current cue indices
+
+
+def _cue_reindex_and_total(cues: List[Dict]) -> float:
+    """Renumber cue indices to 0..n-1 in list order; return summed duration."""
+    total = 0.0
+    for i, c in enumerate(cues):
+        c["index"] = i
+        total += c.get("duration_seconds") or 0
+    return total
+
+
+def _cue_auth_track(db: Session, track_id: int, current_user: User) -> Track:
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Only track creator can edit cues")
+    return track
+
+
+def _cue_load_slot(track_id: int, section: str, item_id: str, slot: str):
+    """Validate section/slot, load the narration doc, return (knowledge, slot_dict).
+
+    Creates an empty slot dict if the item exists but the slot has no text yet, so
+    a cue can be attached to a not-yet-narrated slot. 404 if item_id is unknown.
+    """
+    item_type = _CUE_SECTION_TO_TYPE.get(section)
+    if not item_type:
+        raise HTTPException(status_code=400, detail=f"Invalid section '{section}' (expected pois|routes|segments)")
+    if slot not in _CUE_VALID_SLOTS[item_type]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid slot '{slot}' for {section} (expected {_CUE_VALID_SLOTS[item_type]})",
+        )
+    knowledge = get_narration_knowledge(track_id)
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="No knowledge found for this track")
+    items = knowledge.get(section, {})
+    if item_id not in items:
+        raise HTTPException(status_code=404, detail=f"{item_type} '{item_id}' not found in track knowledge")
+    item = items[item_id]
+    slot_data = item.get(slot)
+    if not isinstance(slot_data, dict):
+        slot_data = {"text": "", "text_original": "", "edited": False, "cues": [], "total_duration": 0}
+        item[slot] = slot_data
+    if not isinstance(slot_data.get("cues"), list):
+        slot_data["cues"] = []
+    return knowledge, slot_data
+
+
+def _cue_persist(track_id: int, track: Track, knowledge: Dict, slot_data: Dict, section: str, item_id: str, slot: str) -> Dict:
+    """Recompute index/total_duration, save the doc, return the standard response."""
+    slot_data["total_duration"] = _cue_reindex_and_total(slot_data["cues"])
+    post_id = save_narration_knowledge(track_id, track.name, knowledge)
+    if not post_id:
+        raise HTTPException(status_code=502, detail="Failed to persist cues to content-api")
+    return {
+        "success": True,
+        "section": section,
+        "item_id": item_id,
+        "slot": slot,
+        "content_post_id": post_id,
+        "total_duration": slot_data["total_duration"],
+        "cues": slot_data["cues"],
+    }
+
+
+@router.post("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues")
+def add_cue(
+    track_id: int,
+    section: str,
+    item_id: str,
+    slot: str,
+    body: CueCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Append a cue (text + optional audio_storage_id) to a narration slot.
+
+    section ∈ pois|routes|segments. NOTE: append is not idempotent — re-posting
+    adds a duplicate cue. Use PUT .../cues/{index} to set a known position.
+    """
+    track = _cue_auth_track(db, track_id, current_user)
+    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    slot_data["cues"].append({
+        "index": len(slot_data["cues"]),
+        "text": body.text,
+        "audio_storage_id": body.audio_storage_id,
+        "duration_seconds": body.duration_seconds or 0,
+    })
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+
+
+@router.put("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/{index}")
+def update_cue(
+    track_id: int,
+    section: str,
+    item_id: str,
+    slot: str,
+    index: int,
+    body: CueUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Partial-update the cue at {index}. Idempotent. 404 if index out of range."""
+    track = _cue_auth_track(db, track_id, current_user)
+    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    cues = slot_data["cues"]
+    if index < 0 or index >= len(cues):
+        raise HTTPException(status_code=404, detail=f"Cue index {index} out of range (0..{len(cues) - 1})")
+    if body.text is not None:
+        cues[index]["text"] = body.text
+    if body.audio_storage_id is not None:
+        cues[index]["audio_storage_id"] = body.audio_storage_id
+    if body.duration_seconds is not None:
+        cues[index]["duration_seconds"] = body.duration_seconds
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+
+
+@router.delete("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/{index}")
+def delete_cue(
+    track_id: int,
+    section: str,
+    item_id: str,
+    slot: str,
+    index: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove the cue at {index}; remaining cues are renumbered. 404 if out of range."""
+    track = _cue_auth_track(db, track_id, current_user)
+    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    cues = slot_data["cues"]
+    if index < 0 or index >= len(cues):
+        raise HTTPException(status_code=404, detail=f"Cue index {index} out of range (0..{len(cues) - 1})")
+    cues.pop(index)
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+
+
+@router.post("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/reorder")
+def reorder_cues(
+    track_id: int,
+    section: str,
+    item_id: str,
+    slot: str,
+    body: CueReorder,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reorder cues. body.order must be a permutation of the current indices."""
+    track = _cue_auth_track(db, track_id, current_user)
+    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    cues = slot_data["cues"]
+    if sorted(body.order) != list(range(len(cues))):
+        raise HTTPException(
+            status_code=409,
+            detail=f"order must be a permutation of 0..{len(cues) - 1}, got {body.order}",
+        )
+    slot_data["cues"] = [cues[i] for i in body.order]
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+
+
 @router.delete("/{track_id}/knowledge")
 def delete_track_knowledge(
     track_id: int,
