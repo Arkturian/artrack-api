@@ -20,6 +20,12 @@ AUTHOR_ID = "artrack-system"
 AUTHOR_NAME = "ARTrack Knowledge System"
 PARTNER_ID = "artrack"
 
+# content-api requires auth on writes (Bearer JWT or X-API-KEY). We send the shared
+# internal API key (same one used for ai-api). Set on the httpx.Client so it rides on
+# every request (list/detail GETs + create/update/delete). Without this, all narration
+# saves 401 silently → "Failed to persist".
+_AUTH_HEADERS = {"X-API-KEY": settings.API_KEY}
+
 
 def _slug_for_track(track_id: int) -> str:
     """Deterministic slug for a track's narration post."""
@@ -34,7 +40,7 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
     """
     slug = _slug_for_track(track_id)
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             # Try to find by slug via posts list endpoint
             resp = client.get(
                 f"{CONTENT_API_BASE}/api/v1/posts/",
@@ -133,7 +139,7 @@ def save_narration_knowledge(
     try:
         existing = get_narration_post(track_id)
 
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             if existing:
                 # Update existing post
                 post_id = existing["id"]
@@ -179,7 +185,7 @@ def delete_narration_post(track_id: int) -> bool:
 
     post_id = existing["id"]
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             resp = client.delete(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/")
             if resp.status_code in (200, 204):
                 logger.info(f"Deleted narration post {post_id} for track {track_id}")
