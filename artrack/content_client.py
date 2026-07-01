@@ -53,17 +53,16 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
             data = resp.json()
             posts = data.get("posts", [])
 
-            # Find the post for this track by slug or metadata
+            # Find this track's CANONICAL narration post by slug ONLY.
+            # The old metadata_json.track_id fallback caused a collision once per-language
+            # sibling posts (translations, other personas) were introduced: those carry the
+            # SAME metadata_json.track_id but a DIFFERENT slug, so a track_id-match would
+            # return an arbitrary translation instead of the canonical source. Slug-exact is
+            # the stable identity — only the canonical source has slug artrack-narration-{id};
+            # the per-(persona,lang) variants are resolved via the Content resolver, not here.
             for post in posts:
                 if post.get("slug") == slug:
                     # Fetch full details
-                    detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}/")
-                    if detail_resp.status_code == 200:
-                        return detail_resp.json()
-                    return post
-
-                meta = post.get("metadata_json") or {}
-                if meta.get("track_id") == track_id:
                     detail_resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post['id']}/")
                     if detail_resp.status_code == 200:
                         return detail_resp.json()
