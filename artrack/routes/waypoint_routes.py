@@ -230,7 +230,8 @@ async def list_waypoints_detail(
     track_id: int,
     segment_id: int | None = None,
     waypoint_type: str | None = Query(None, description="filter by waypoint_type; comma-separated for multiple, e.g. 'manual,screen_point'"),
-    fields: str | None = Query(None, description="'slim' returns a lightweight projection (id, coords, type, title, category, color, thumbnail_url) without media/assets/snap/HLS — for fast map first-paint"),
+    fields: str | None = Query(None, description="'slim' returns a lightweight projection (id, coords, type, title, category, color, thumbnail_url, segment_role) without media/assets/snap/HLS — for fast map first-paint"),
+    exclude_segment_markers: bool = Query(False, description="drop segment start/end marker waypoints (metadata_json.segment.role) — they are structural, not balloon POIs"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = 200,
@@ -253,6 +254,15 @@ async def list_waypoints_detail(
         if types:
             query = query.filter(Waypoint.waypoint_type.in_(types))
     waypoints = query.offset(offset).limit(limit).all()
+
+    if exclude_segment_markers:
+        # segment start/end markers are structural, not balloon POIs — filtered
+        # python-side (role lives inside the JSON column). NOTE: limit/offset
+        # apply BEFORE this filter (consistent with the query semantics above).
+        waypoints = [
+            wp for wp in waypoints
+            if ((wp.metadata_json or {}).get("segment") or {}).get("role") not in ("start", "end")
+        ]
 
     if fields == "slim":
         # First-paint projection: no per-waypoint media query, no HLS probes, no
@@ -284,6 +294,7 @@ async def list_waypoints_detail(
                 # full payload hydrates. Small (~100-300B/POI where present).
                 "settings": md.get("settings"),
                 "user_description": wp.user_description,
+                "segment_role": (md.get("segment") or {}).get("role"),
             })
         return slim
 
