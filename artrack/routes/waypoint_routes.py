@@ -19,7 +19,7 @@ from ..models import (
     MediaAnalysis, User, WaypointDetailResponse, WaypointListItem, WaypointLocation, SimpleUserRef, StorageObject
 )
 from ..auth import get_current_user
-from ..asset_urls import enrich_assets_in_metadata, attach_hls_to_assets
+from ..asset_urls import enrich_asset, enrich_assets_in_metadata, attach_hls_to_assets
 from ..services.track_bbox import _haversine_m
 from artrack.storage_domain import save_file_and_record
 from clients.storage_client import generic_storage, enqueue_ai_safety_and_transcoding
@@ -225,10 +225,12 @@ async def get_waypoint_status(
         metadata_json=waypoint.metadata_json,
     )
 
-@router.get("/tracks/{track_id}/waypoints/detail", response_model=List[WaypointDetailResponse])
+@router.get("/tracks/{track_id}/waypoints/detail", response_model=None)
 async def list_waypoints_detail(
     track_id: int,
     segment_id: int | None = None,
+    waypoint_type: str | None = Query(None, description="filter by waypoint_type; comma-separated for multiple, e.g. 'manual,screen_point'"),
+    fields: str | None = Query(None, description="'slim' returns a lightweight projection (id, coords, type, title, category, color, thumbnail_url) without media/assets/snap/HLS — for fast map first-paint"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = 200,
@@ -246,7 +248,40 @@ async def list_waypoints_detail(
     query = db.query(Waypoint).filter(Waypoint.track_id == track_id)
     if segment_id is not None:
         query = query.filter(Waypoint.segment_id == segment_id)
+    if waypoint_type:
+        types = [t.strip() for t in waypoint_type.split(",") if t.strip()]
+        if types:
+            query = query.filter(Waypoint.waypoint_type.in_(types))
     waypoints = query.offset(offset).limit(limit).all()
+
+    if fields == "slim":
+        # First-paint projection: no per-waypoint media query, no HLS probes, no
+        # full metadata enrichment — thumbnail_url is derived purely from the
+        # main/icon asset reference (host-aware string build, zero HTTP).
+        slim: list[dict] = []
+        for wp in waypoints:
+            md = wp.metadata_json or {}
+            thumb = None
+            assets = md.get("assets")
+            if isinstance(assets, list) and assets:
+                cand = next((a for a in assets if isinstance(a, dict) and a.get("role") in ("main", "icon")), None) \
+                    or next((a for a in assets if isinstance(a, dict) and a.get("id") is not None), None)
+                if cand:
+                    thumb = enrich_asset(cand).get("thumbnail_url")
+            slim.append({
+                "id": wp.id,
+                "latitude": wp.latitude,
+                "longitude": wp.longitude,
+                "waypoint_type": wp.waypoint_type,
+                "title": md.get("title"),
+                "category": md.get("category"),
+                "subcategory": md.get("subcategory"),
+                "color": md.get("color"),
+                "thumbnail_url": thumb,
+                "priority": getattr(wp, "priority", None),
+            })
+        return slim
+
     result: list[WaypointDetailResponse] = []
     for wp in waypoints:
         media_files = db.query(MediaFile).filter(MediaFile.waypoint_id == wp.id).all()
