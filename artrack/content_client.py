@@ -172,6 +172,49 @@ def save_narration_knowledge(
         return None
 
 
+def resolve_narration(
+    track_id: int,
+    persona: Optional[str] = None,
+    lang: Optional[str] = None,
+    include_content: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Resolve the (persona, lang) narration cell via the content-api resolver.
+
+    Content owns the persona×language post matrix AND the fallback cascade
+    ((p,l)→(p,de)→(dr_tschauko,l)→(dr_tschauko,de), flagged via
+    ``fallback_applied``) — we deliberately do NOT reimplement that here so the
+    semantics can't drift between consumers. With include_content=True the
+    resolver returns the post's JSON content in the same call (no second fetch).
+
+    Returns the resolver response dict, ``{"error": 404, "detail": ...}`` when
+    the cell (incl. all fallbacks) doesn't exist, or None if the resolver is
+    unreachable.
+    """
+    params: Dict[str, Any] = {"track_id": track_id}
+    if persona:
+        params["persona"] = persona
+    if lang:
+        params["lang"] = lang
+    if include_content:
+        params["include_content"] = "true"
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+            resp = client.get(f"{CONTENT_API_BASE}/api/v1/narrations", params=params)
+            if resp.status_code == 404:
+                try:
+                    detail = resp.json().get("detail")
+                except Exception:
+                    detail = None
+                return {"error": 404, "detail": detail}
+            if resp.status_code != 200:
+                logger.error(f"Narration resolver failed: {resp.status_code} {resp.text[:200]}")
+                return None
+            return resp.json()
+    except httpx.RequestError as e:
+        logger.error(f"Narration resolver request failed: {e}")
+        return None
+
+
 def delete_narration_post(track_id: int) -> bool:
     """
     Delete the narration post for a track.

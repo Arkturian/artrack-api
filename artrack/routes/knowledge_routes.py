@@ -36,6 +36,7 @@ from ..content_client import (
     get_narration_knowledge,
     save_narration_knowledge,
     delete_narration_post,
+    resolve_narration,
 )
 
 router = APIRouter()
@@ -449,11 +450,22 @@ def _fallback_split(text: str) -> List[str]:
 @router.get("/{track_id}/knowledge")
 def get_track_knowledge(
     track_id: int,
+    persona: Optional[str] = None,
+    lang: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Get all knowledge for a track.
+
+    Without persona/lang: the canonical (German, dr_tschauko) narration doc —
+    unchanged legacy behavior.
+
+    With ?persona= and/or ?lang=: resolves the matching (persona × language)
+    narration post via the content-api resolver (which owns the fallback
+    cascade) and returns THAT doc. The response then additionally carries
+    content_post_id, persona_id, language and fallback_applied so the client
+    can tell which cell it actually got.
 
     Returns:
     - routes: List of routes with their intro/outro
@@ -472,7 +484,29 @@ def get_track_knowledge(
     data = _load_track_data(db, track_id)
 
     # Load narrative texts from content-api
-    content_knowledge = get_narration_knowledge(track_id)
+    resolver_meta = None
+    if persona or lang:
+        res = resolve_narration(track_id, persona=persona, lang=lang)
+        if res is None:
+            raise HTTPException(status_code=502, detail="Narration resolver unreachable")
+        if res.get("error") == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=res.get("detail") or f"No narration for persona={persona} lang={lang}",
+            )
+        raw = res.get("content")
+        try:
+            content_knowledge = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=502, detail="Resolved narration post has invalid JSON content")
+        resolver_meta = {
+            "content_post_id": res.get("post_id"),
+            "persona_id": res.get("persona_id"),
+            "language": res.get("language"),
+            "fallback_applied": bool(res.get("fallback_applied")),
+        }
+    else:
+        content_knowledge = get_narration_knowledge(track_id)
 
     if content_knowledge:
         knowledge = content_knowledge
@@ -529,8 +563,18 @@ def get_track_knowledge(
                 "at_poi": {"text": "", "edited": False}
             }
         else:
-            knowledge["pois"][pid]["name"] = poi_name
-            knowledge["pois"][pid]["description"] = poi.user_description or ""
+            # F9 (approved 2026-07-03): in a persona/lang read the narration doc's
+            # pois[].name/description ARE the translated display values — never
+            # overwrite them with the DE-only waypoint fields. The waypoint title
+            # stays the bootstrap/fallback for cells the doc doesn't fill.
+            if resolver_meta is None:
+                knowledge["pois"][pid]["name"] = poi_name
+                knowledge["pois"][pid]["description"] = poi.user_description or ""
+            else:
+                if not (knowledge["pois"][pid].get("name") or "").strip():
+                    knowledge["pois"][pid]["name"] = poi_name
+                if not (knowledge["pois"][pid].get("description") or "").strip():
+                    knowledge["pois"][pid]["description"] = poi.user_description or ""
 
         # Merge radius and priority from waypoint metadata
         poi_meta = poi.metadata_json or {}
@@ -605,12 +649,15 @@ def get_track_knowledge(
                 {"id": c["id"], "name": c["name"]} for c in characters
             ]
     
-    return {
+    resp = {
         "exists": has_route_texts or has_segment_texts or has_poi_texts,
         "knowledge": knowledge,
         "track_id": track_id,
         "track_name": track.name
     }
+    if resolver_meta:
+        resp.update(resolver_meta)
+    return resp
 
 
 # ============ Knowledge Version Endpoint (for Cache Validation) ============
