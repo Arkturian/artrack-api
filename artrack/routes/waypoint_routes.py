@@ -279,6 +279,11 @@ async def list_waypoints_detail(
                 "color": md.get("color"),
                 "thumbnail_url": thumb,
                 "priority": getattr(wp, "priority", None),
+                # settings must ride in the first paint: display.enabled (soft-hide)
+                # and per-app pin_style overrides otherwise flash wrong until the
+                # full payload hydrates. Small (~100-300B/POI where present).
+                "settings": md.get("settings"),
+                "user_description": wp.user_description,
             })
         return slim
 
