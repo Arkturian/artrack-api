@@ -36,6 +36,21 @@ POI_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "castle": {"bezeichnung": "Burg/Schloss", "icon": "🏰"},
         }
     },
+    "story": {
+        # Story reference anchors: a map pin linking a Content story
+        # (metadata_json.story_group + story_id) — click opens the story viewer.
+        # Distinct from waypoint_type=story_point (sequenced voice-guide scene
+        # anchors); story-category pins stay waypoint_type=manual.
+        "bezeichnung": "Geschichte & Sage",
+        "farbe": "#9333EA",
+        "icon": "📖",
+        "unterkategorien": {
+            "sage": {"bezeichnung": "Sage/Legende", "icon": "🐉"},
+            "geschichte": {"bezeichnung": "Historische Geschichte", "icon": "📜"},
+            "maerchen": {"bezeichnung": "Märchen", "icon": "🧚"},
+            "anekdote": {"bezeichnung": "Anekdote", "icon": "💬"},
+        }
+    },
     "navigation": {
         "bezeichnung": "Navigation",
         "farbe": "#3B82F6",

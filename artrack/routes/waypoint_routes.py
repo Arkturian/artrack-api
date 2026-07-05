@@ -295,6 +295,10 @@ async def list_waypoints_detail(
                 "settings": md.get("settings"),
                 "user_description": wp.user_description,
                 "segment_role": (md.get("segment") or {}).get("role"),
+                # story reference anchors (category=story): the click handler needs
+                # the target story already at first paint, before hydration.
+                "story_group": md.get("story_group"),
+                "story_id": md.get("story_id"),
             })
         return slim
 
