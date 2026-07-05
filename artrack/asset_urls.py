@@ -92,7 +92,12 @@ def enrich_assets_in_metadata(metadata: Optional[dict]) -> Optional[dict]:
 # NOT derivable from the asset id, so we read it from the header. Cached per asset.
 import time as _time
 _HLS_CACHE: dict = {}            # asset_id(int) -> (expiry_epoch, hls_url_or_None)
-_HLS_TTL = 600                    # 10 min
+# TTL split: a COMPLETED transcode is stable (the manifest doesn't disappear) →
+# cache long. A None result (not/never transcoded) only needs occasional
+# re-checking. The old flat 10-min TTL made the first waypoints/detail request
+# after every expiry pay a ~3.5s probe burst for ~60 never-transcoded videos.
+_HLS_TTL_COMPLETED = 24 * 3600    # 24 h
+_HLS_TTL_NONE = 1800              # 30 min
 
 
 async def resolve_hls_url(asset_id: Any, storage_host: Optional[str] = None) -> Optional[str]:
@@ -119,7 +124,7 @@ async def resolve_hls_url(asset_id: Any, storage_host: Optional[str] = None) -> 
                         hls = h
         except Exception:
             hls = None
-        _HLS_CACHE[asset_id] = (now + _HLS_TTL, hls)
+        _HLS_CACHE[asset_id] = (now + (_HLS_TTL_COMPLETED if hls else _HLS_TTL_NONE), hls)
         return hls
     except Exception:
         return None
