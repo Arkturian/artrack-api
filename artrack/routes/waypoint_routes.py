@@ -19,7 +19,7 @@ from ..models import (
     MediaAnalysis, User, WaypointDetailResponse, WaypointListItem, WaypointLocation, SimpleUserRef, StorageObject
 )
 from ..auth import get_current_user
-from ..asset_urls import enrich_asset, enrich_assets_in_metadata, attach_hls_to_assets
+from ..asset_urls import enrich_asset, enrich_assets_in_metadata, attach_hls_to_assets, resolve_hls_url
 from ..services.track_bbox import _haversine_m
 from artrack.storage_domain import save_file_and_record
 from clients.storage_client import generic_storage, enqueue_ai_safety_and_transcoding
@@ -302,9 +302,40 @@ async def list_waypoints_detail(
             })
         return slim
 
+    # Batch the media lookup: one IN-query instead of one query per waypoint.
+    # The previous N+1 pattern was the dominant cost of this endpoint (~5s for
+    # 812 waypoints on SQLite at ~6ms/query).
+    media_by_wp: dict = {}
+    wp_ids = [wp.id for wp in waypoints]
+    if wp_ids:
+        for mf in db.query(MediaFile).filter(MediaFile.waypoint_id.in_(wp_ids)).all():
+            media_by_wp.setdefault(mf.waypoint_id, []).append(mf)
+
+    # Warm the HLS cache concurrently for all video assets up front. The
+    # per-waypoint attach_hls_to_assets below then hits only warm cache entries —
+    # this turns the cold-cache case from N sequential HTTP probes into one
+    # parallel burst (and is a no-op when the cache is warm).
+    _video_refs = []
+    _seen_vid = set()
+    for wp in waypoints:
+        for a in ((wp.metadata_json or {}).get("assets") or []):
+            if not isinstance(a, dict) or a.get("id") is None or a.get("hls_url"):
+                continue
+            if a.get("role") == "video" or str(a.get("mime_type") or "").startswith("video"):
+                key = (a["id"], a.get("storage_host"))
+                if key not in _seen_vid:
+                    _seen_vid.add(key)
+                    _video_refs.append(key)
+    if _video_refs:
+        import asyncio as _asyncio
+        await _asyncio.gather(
+            *(resolve_hls_url(aid, host) for aid, host in _video_refs),
+            return_exceptions=True,
+        )
+
     result: list[WaypointDetailResponse] = []
     for wp in waypoints:
-        media_files = db.query(MediaFile).filter(MediaFile.waypoint_id == wp.id).all()
+        media_files = media_by_wp.get(wp.id, [])
         media = [
             {
                 "media_id": mf.id,

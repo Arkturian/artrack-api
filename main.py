@@ -65,6 +65,11 @@ app = FastAPI(
     description="Track management and collaboration service"
 )
 
+# gzip: waypoint/knowledge list payloads are large JSON (waypoints/detail full =
+# ~800KB raw → ~10x smaller compressed); nginx does not compress proxied JSON here.
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # CORS
 # NOTE: allow_origins=["*"] together with allow_credentials=True is INVALID per the
 # Fetch spec — the browser rejects a wildcard Access-Control-Allow-Origin whenever the
