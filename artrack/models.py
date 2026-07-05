@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, Boolean, JSON, ForeignKey, Index
+from sqlalchemy import BigInteger, Column, Integer, String, Float, Text, DateTime, Boolean, JSON, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref
 from datetime import datetime
@@ -21,8 +21,8 @@ class User(Base):
     device_ids = Column(JSON, default=list)  # List of device IDs
     
     # Quotas
-    storage_bytes_used = Column(Integer, default=0)
-    storage_bytes_limit = Column(Integer, default=5368709120)  # 5GB
+    storage_bytes_used = Column(BigInteger, default=0)
+    storage_bytes_limit = Column(BigInteger, default=5368709120)  # 5GB
     uploads_this_month = Column(Integer, default=0)
     upload_limit_per_month = Column(Integer, default=1000)
     
@@ -186,7 +186,7 @@ class MediaFile(Base):
     thumbnail_url = Column(String, nullable=True)
     
     # Upload info
-    file_size_bytes = Column(Integer)
+    file_size_bytes = Column(BigInteger)
     mime_type = Column(String)
     checksum = Column(String)
     # Idempotency
@@ -273,7 +273,7 @@ class StorageObject(Base):
     thumbnail_url = Column(String, nullable=True)
     webview_url = Column(String, nullable=True)  # Web-optimized image URL
     mime_type = Column(String)
-    file_size_bytes = Column(Integer)
+    file_size_bytes = Column(BigInteger)
     checksum = Column(String)
     is_public = Column(Boolean, default=False)
     context = Column(String, nullable=True)
