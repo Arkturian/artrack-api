@@ -98,6 +98,8 @@ app.include_router(guide_routes.router, prefix="/guides", tags=["Audio Guides"])
 app.include_router(categories_routes.router, prefix="/categories", tags=["Categories"])
 app.include_router(knowledge_routes.router, prefix="/tracks", tags=["Route Knowledge"])
 app.include_router(osm_routes.router, prefix="/osm", tags=["OpenStreetMap"])
+from artrack.routes import weather_routes
+app.include_router(weather_routes.router, prefix="/weather", tags=["Weather"])
 app.include_router(places_routes.router, prefix="/places", tags=["Google Places"])
 # Admin endpoints (system stats, storage cascade-cleanup, moderation) — was
 # defined but never mounted; mounting now so the cleanup-refs callback used
