@@ -1,32 +1,21 @@
-name: Build & Deploy
+name: Deploy to Production (arkserver)
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
       - name: Build application
         run: echo 'No build needed for FastAPI'
 
-      - name: Deploy to server
+      - name: Deploy to arkserver
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -36,154 +25,29 @@ jobs:
           script: |
             set -e
 
-            REPO_URL="https://github.com/apopovic77/artrack-api.git"
-            REPO_PATH="/opt/repos/artrack-api"
-            DEPLOY_PATH="/var/www/api-artrack.arkturian.com"
+            DEPLOY_PATH="/var/www/api-artrack.arkserver.arkturian.com"
             BACKUP_DIR="/var/backups"
-            BACKUP_PREFIX="artrack-api"
             TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-            BACKUP_PATH="$BACKUP_DIR/${BACKUP_PREFIX}-${TIMESTAMP}"
 
-            # Clone or update repo
-            if [ ! -d "$REPO_PATH" ]; then
-              echo "Cloning repository..."
-              mkdir -p /opt/repos
-              git clone "$REPO_URL" "$REPO_PATH"
-            fi
+            # DB backup (Postgres since 2026-07-05 cutover)
+            echo "Backing up Postgres..."
+            sudo -n -u postgres pg_dump -Fc artrack > /tmp/artrack-${TIMESTAMP}.dump
+            sudo -n mkdir -p "$BACKUP_DIR"
+            sudo -n mv /tmp/artrack-${TIMESTAMP}.dump "$BACKUP_DIR/"
+            # keep the last 14 dumps
+            ls -1t "$BACKUP_DIR"/artrack-*.dump 2>/dev/null | tail -n +15 | xargs -r sudo -n rm --
 
-            cd "$REPO_PATH"
+            # Code update (deploy dir is a git clone tracking origin/main)
+            cd "$DEPLOY_PATH"
             git fetch origin main
             git reset --hard origin/main
 
-            # Create backup
-            if [ -d "$DEPLOY_PATH" ]; then
-              echo "Creating backup..."
-              mkdir -p "$BACKUP_DIR"
-              cp -r "$DEPLOY_PATH" "$BACKUP_PATH"
-              echo "Backup saved to: $BACKUP_PATH"
-            fi
+            # Dependencies into the instance venv
+            ./venv/bin/pip install -q -r requirements.txt
 
-            # Deploy
-            echo "Deploying FastAPI application..."
-            mkdir -p "$DEPLOY_PATH"
-            rsync -av --delete \
-              --exclude='.git' \
-              --exclude='__pycache__' \
-              --exclude='*.pyc' \
-              --exclude='.env' \
-              --exclude='venv' \
-              "$REPO_PATH/" "$DEPLOY_PATH/"
-
-            # Install dependencies in deployment directory
-            cd "$DEPLOY_PATH"
-            /root/.pyenv/versions/3.11.9/bin/pip install -r requirements.txt
-
-            # Set permissions
-            chown -R www-data:www-data "$DEPLOY_PATH"
-            chmod -R 755 "$DEPLOY_PATH"
-
-            # Database Migration with Backup
-            DB_PATH="/var/lib/api-arkturian/artrack.db"
-            DB_BACKUP="/var/backups/artrack-db-${TIMESTAMP}.db"
-
-            if [ -f "$DB_PATH" ]; then
-              echo "📦 Backing up database..."
-              cp "$DB_PATH" "$DB_BACKUP"
-              echo "✅ Database backed up to: $DB_BACKUP"
-            fi
-
-            # Run Alembic migrations (if alembic directory exists)
-            if [ -d "alembic" ]; then
-              echo "🔄 Running database migrations..."
-              /root/.pyenv/versions/3.11.9/bin/alembic upgrade head || {
-                echo "❌ Migration failed! Restoring backup..."
-                cp "$DB_BACKUP" "$DB_PATH"
-                exit 1
-              }
-              echo "✅ Migrations completed successfully"
-            else
-              echo "⚠️  No alembic migrations found (skipping)"
-            fi
-
-            # Run custom migrations (if migrations directory exists)
-            if [ -d "migrations" ]; then
-              echo "🔄 Running custom migrations..."
-              for migration in migrations/*.py; do
-                echo "  Running: $migration"
-                DATABASE_PATH="$DB_PATH" /root/.pyenv/versions/3.11.9/bin/python "$migration" || {
-                  echo "❌ Migration $migration failed!"
-                  exit 1
-                }
-              done
-              echo "✅ Custom migrations completed"
-            fi
-
-            # Clean up orphaned state from the aborted frontend-fusion
-            # experiment (2026-04-09). The GPS tracker UI now lives in
-            # a separate repo (apopovic77/audio-guide) and is served
-            # by nginx directly from /var/www/gps-tracker.arkturian.com/.
-            # artrack-api is pure API again — no Environment injection,
-            # no static mounts.
-            if [ -f /etc/systemd/system/artrack-api.service.d/env.conf ]; then
-              echo "Removing orphaned artrack-api systemd drop-in..."
-              rm -f /etc/systemd/system/artrack-api.service.d/env.conf
-              rmdir /etc/systemd/system/artrack-api.service.d 2>/dev/null || true
-              systemctl daemon-reload
-              echo "✅ Drop-in removed, daemon reloaded"
-            fi
-
-            # Restart service
-            echo "Restarting artrack-api service..."
-            systemctl restart artrack-api
-
-            echo "✅ Deployment completed successfully!"
-            systemctl status artrack-api --no-pager -l
-
-      - name: Notify on success
-        if: success()
-        run: echo "✅ Deployment successful for commit ${{ github.sha }}"
-
-      - name: Notify on failure
-        if: failure()
-        run: echo "❌ Deployment failed for commit ${{ github.sha }}"
-
-  trigger-sdk-regeneration:
-    needs: build-and-deploy
-    runs-on: ubuntu-latest
-    if: success()
-
-    steps:
-      - name: Trigger TypeScript SDK regeneration
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.PAT_TOKEN }}
-          repository: apopovic77/artrack-api-typescript-sdk
-          event-type: openapi-updated
-
-      - name: Trigger C# SDK regeneration
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.PAT_TOKEN }}
-          repository: apopovic77/artrack-api-csharp-sdk
-          event-type: openapi-updated
-
-      - name: Trigger Swift SDK regeneration
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.PAT_TOKEN }}
-          repository: apopovic77/artrack-sdk-swift
-          event-type: openapi-updated
-
-  trigger-e2e-tests:
-    needs: build-and-deploy
-    runs-on: ubuntu-latest
-    if: success()
-
-    steps:
-      - name: Trigger E2E tests
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.PAT_TOKEN }}
-          repository: apopovic77/api-e2e-tests
-          event-type: artrack-api-deployed
-          client-payload: '{"api": "artrack", "sha": "${{ github.sha }}"}'
+            # Restart + health check
+            sudo -n systemctl restart artrack-api
+            sleep 4
+            sudo -n systemctl is-active artrack-api
+            curl -sf -o /dev/null http://127.0.0.1:8001/weather
+            echo "✅ Deployment completed (arkserver/Postgres)"
