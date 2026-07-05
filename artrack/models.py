@@ -625,3 +625,33 @@ class AsyncTask(Base):
 
     # Relationship
     storage_object = relationship("StorageObject", backref=backref("async_tasks", passive_deletes='all'))
+
+
+class GpsPing(Base):
+    """Anonymised visitor position ping (occupancy/presence feature, 2026-07-05).
+
+    session_id is a CLIENT-generated opaque id per visit — no server-side user
+    linkage (privacy by design). The client keeps its own session ids, so
+    "where was I" works for the owner of the session while the server only
+    ever sees anonymous sessions. Raw pings are transient telemetry
+    (retention: see presence_routes cleanup), aggregates come later.
+    """
+    __tablename__ = "gps_pings"
+
+    # BIGSERIAL on PG; plain INTEGER rowid on SQLite (dev)
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    track_id = Column(Integer, ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(String(64), nullable=False, index=True)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    altitude = Column(Float, nullable=True)
+    accuracy = Column(Float, nullable=True)
+    speed_kmh = Column(Float, nullable=True)
+    heading = Column(Float, nullable=True)
+    recorded_at = Column(DateTime, nullable=False)     # client clock
+    received_at = Column(DateTime, default=datetime.utcnow, nullable=False)  # server clock (authoritative for presence)
+
+    __table_args__ = (
+        Index("ix_gps_pings_track_received", "track_id", "received_at"),
+        Index("ix_gps_pings_track_session_recorded", "track_id", "session_id", "recorded_at"),
+    )
