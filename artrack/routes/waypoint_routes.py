@@ -120,7 +120,9 @@ async def create_waypoints(
                 processing_state="pending",
                 waypoint_type=waypoint_data.waypoint_type,
                 metadata_json=waypoint_data.metadata_json or {},
-                segment_id=waypoint_data.segment_id
+                segment_id=waypoint_data.segment_id,
+                route_id=waypoint_data.route_id,
+                created_by=current_user.id
             )
             
             db.add(db_waypoint)
