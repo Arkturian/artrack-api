@@ -137,6 +137,14 @@ def save_narration_knowledge(
 
     try:
         existing = get_narration_post(track_id)
+        if existing:
+            # Merge over the existing metadata instead of replacing it — the post
+            # may carry fields owned by others (e.g. persona_id set by the doc
+            # author; the resolver's exact-match and honesty semantics depend on
+            # it). Clobbering it silently degrades those posts to fallback-only.
+            merged_meta = dict(existing.get("metadata_json") or {})
+            merged_meta.update(post_data["metadata_json"])
+            post_data["metadata_json"] = merged_meta
 
         with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             if existing:
