@@ -1,4 +1,4 @@
-from fastapi import HTTPException, Header, Depends
+from fastapi import HTTPException, Header, Depends, Request
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -79,10 +79,20 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
         user.last_active_at = datetime.utcnow()
         db.commit()
         return user
-    
+
+    # Check read-only keys: same identity, but mutating requests are
+    # rejected in get_current_user via the transient marker below
+    user = db.query(User).filter(User.api_key_readonly == api_key).first()
+    if user:
+        user.last_active_at = datetime.utcnow()
+        db.commit()
+        user._readonly_key = True
+        return user
+
     return None
 
 def get_current_user(
+    request: Request,
     api_key: str = Header(None, alias="X-API-KEY"),
     db: Session = Depends(get_db)
 ) -> User:
@@ -94,6 +104,8 @@ def get_current_user(
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if getattr(user, "_readonly_key", False) and request.method not in ("GET", "HEAD", "OPTIONS"):
+        raise HTTPException(status_code=403, detail="Read-only API key: write operations are not allowed")
     return user
 
 def get_current_user_optional(

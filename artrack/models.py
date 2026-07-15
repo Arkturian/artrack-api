@@ -17,6 +17,7 @@ class User(Base):
     display_name = Column(String)
     password_hash = Column(String)
     api_key = Column(String, unique=True, index=True)
+    api_key_readonly = Column(String, unique=True, index=True, nullable=True)  # second key, GET-only (safe to embed in client bundles)
     trust_level = Column(String, default="new_user")  # new_user, trusted, moderator, admin
     device_ids = Column(JSON, default=list)  # List of device IDs
     
