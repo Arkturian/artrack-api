@@ -227,6 +227,82 @@ def _get_track_polylines(db: Session, track_id: int) -> dict:
 def _invalidate_polyline_cache(track_id: int) -> None:
     """Drop the cached polylines for a track (call after route geometry edits)."""
     _POLYLINE_CACHE.pop(track_id, None)
+    _MEMBERSHIP_GEOM_CACHE.pop(track_id, None)
+    _WP_ROUTE_DIST_CACHE.pop(track_id, None)
+
+
+# Route-membership evaluation was the dominant cost of /overview, /pretty and
+# friends: the per-waypoint runtime snap re-queried ALL routes + ALL gps_track
+# rows and re-projected against every polyline FOR EVERY WAYPOINT (~600 full
+# scans per request, ~25s on track 30). Both layers below are per-track
+# memoized with the polyline TTL; geometry edits invalidate via
+# _invalidate_polyline_cache.
+_MEMBERSHIP_GEOM_CACHE: dict = {}
+_WP_ROUTE_DIST_CACHE: dict = {}
+
+
+def _get_membership_geometry(db: Session, track_id: int, track: Track):
+    """Return (route_ids, {route_id: polyline}) with the exact selection
+    semantics of the runtime-snap path (created_by filter, timestamp order,
+    column route_id with metadata_json.route_id fallback)."""
+    now = time.monotonic()
+    cached = _MEMBERSHIP_GEOM_CACHE.get(track_id)
+    if cached and cached[0] > now:
+        return cached[1], cached[2]
+
+    all_routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    all_gps = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.waypoint_type == "gps_track",
+        Waypoint.created_by == track.created_by
+    ).order_by(Waypoint.timestamp.asc()).all()
+
+    polylines: dict = {}
+    for r in all_routes:
+        pts = []
+        for p in all_gps:
+            if getattr(p, 'route_id', None) == r.id:
+                pts.append((p.latitude, p.longitude))
+            elif p.metadata_json and p.metadata_json.get('route_id') == r.id:
+                pts.append((p.latitude, p.longitude))
+        if len(pts) >= 2:
+            polylines[r.id] = pts
+
+    route_ids = [r.id for r in all_routes]
+    _MEMBERSHIP_GEOM_CACHE[track_id] = (now + _POLYLINE_CACHE_TTL, route_ids, polylines)
+    return route_ids, polylines
+
+
+def _get_wp_route_distances(wp: Waypoint, track_id: int, db: Session, track: Track) -> list:
+    """Unfiltered snap distances of one waypoint to every route polyline,
+    memoized per (waypoint, position) so the 4-routes-in-a-row app startup pays
+    the projection cost only once."""
+    now = time.monotonic()
+    per_track = _WP_ROUTE_DIST_CACHE.get(track_id)
+    if not per_track or per_track[0] <= now:
+        per_track = (now + _POLYLINE_CACHE_TTL, {})
+        _WP_ROUTE_DIST_CACHE[track_id] = per_track
+    key = (wp.id, wp.latitude, wp.longitude)
+    hit = per_track[1].get(key)
+    if hit is not None:
+        return hit
+
+    route_ids, polylines = _get_membership_geometry(db, track_id, track)
+    dists = []
+    for rid in route_ids:
+        polyline = polylines.get(rid)
+        if not polyline:
+            continue
+        dist_meters, along_meters, snap_lat, snap_lon = _closest_point_on_polyline(polyline, wp.latitude, wp.longitude)
+        dists.append({
+            'route_id': rid,
+            'distance': dist_meters,
+            'along_meters': along_meters,
+            'snap_lat': snap_lat,
+            'snap_lon': snap_lon,
+        })
+    per_track[1][key] = dists
+    return dists
 
 
 def _waypoint_belongs_to_route(wp: Waypoint, route_id: int, track_id: int, db: Session, track: Track, max_snap_distance: float = 50.0) -> bool:
@@ -256,47 +332,10 @@ def _waypoint_belongs_to_route(wp: Waypoint, route_id: int, track_id: int, db: S
     # Priority 3: Runtime SNAP calculation
     # Check distance to ALL routes and assign to CLOSEST one only
     # (Multi-route only if snap positions are very close together, like shared paths)
-
-    # Get all routes for this track
-    all_routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
-
-    if not all_routes:
-        return False
-
-    # Get all GPS points once
-    all_gps = db.query(Waypoint).filter(
-        Waypoint.track_id == track_id,
-        Waypoint.waypoint_type == "gps_track",
-        Waypoint.created_by == track.created_by
-    ).order_by(Waypoint.timestamp.asc()).all()
-
-    # Calculate distance to each route
-    route_distances = []
-
-    for r in all_routes:
-        # Filter GPS points for this route
-        gps_points = []
-        for p in all_gps:
-            p_route_id = getattr(p, 'route_id', None)
-            if p_route_id == r.id:
-                gps_points.append(p)
-            elif p.metadata_json:
-                meta_route = p.metadata_json.get('route_id')
-                if meta_route == r.id:
-                    gps_points.append(p)
-
-        if len(gps_points) >= 2:
-            polyline = [(p.latitude, p.longitude) for p in gps_points]
-            dist_meters, along_meters, snap_lat, snap_lon = _closest_point_on_polyline(polyline, wp.latitude, wp.longitude)
-
-            if dist_meters <= max_snap_distance:
-                route_distances.append({
-                    'route_id': r.id,
-                    'distance': dist_meters,
-                    'along_meters': along_meters,
-                    'snap_lat': snap_lat,
-                    'snap_lon': snap_lon
-                })
+    # Distances are memoized per (waypoint, position); the threshold is applied
+    # here so one cache entry serves every max_snap_distance.
+    route_distances = [rd for rd in _get_wp_route_distances(wp, track_id, db, track)
+                       if rd['distance'] <= max_snap_distance]
 
     if not route_distances:
         # No route within threshold
@@ -541,6 +580,50 @@ async def get_route_overview(
         total_segments=len(segments_overview),
         total_waypoints=len(route_waypoints)
     )
+
+@router.get("/{track_id}/routes/{route_id}/waypoint-ids")
+async def get_route_waypoint_ids(
+    track_id: int,
+    route_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Lightweight route membership: ONLY the waypoint ids belonging to this route
+    (same membership semantics as /overview, without resolving any metadata).
+    Built for app startup route-isolation maps (Unity RouteWaypointIds & co.).
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    route = db.query(TrackRouteModel).filter(
+        TrackRouteModel.id == route_id,
+        TrackRouteModel.track_id == track_id
+    ).first()
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    all_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id).all()
+    waypoint_ids = []
+    segment_waypoint_ids = []
+    for wp in all_waypoints:
+        if wp.waypoint_type == "gps_track":
+            continue
+        is_segment_marker = bool(wp.metadata_json and wp.metadata_json.get("segment"))
+        if _waypoint_belongs_to_route(wp, route_id, track_id, db, track):
+            (segment_waypoint_ids if is_segment_marker else waypoint_ids).append(wp.id)
+
+    return {
+        "track_id": track_id,
+        "route_id": route_id,
+        "count": len(waypoint_ids),
+        "waypoint_ids": waypoint_ids,
+        "segment_waypoint_ids": segment_waypoint_ids,
+    }
+
 
 @router.get("/{track_id}/routes/{route_id}/detail", response_model=RouteDetail)
 async def get_route_detail(
