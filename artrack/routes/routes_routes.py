@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional, Tuple
@@ -580,6 +580,105 @@ async def get_route_overview(
         total_segments=len(segments_overview),
         total_waypoints=len(route_waypoints)
     )
+
+def _point_at_along(poly: List[Tuple[float, float]], s: float) -> Tuple[float, float]:
+    """Interpolate the point at along-meters s on a polyline (clamped to ends)."""
+    if s <= 0:
+        return poly[0]
+    total = 0.0
+    for i in range(len(poly) - 1):
+        seg = _haversine(poly[i][0], poly[i][1], poly[i + 1][0], poly[i + 1][1])
+        if total + seg >= s and seg > 0:
+            t = (s - total) / seg
+            return (
+                poly[i][0] + t * (poly[i + 1][0] - poly[i][0]),
+                poly[i][1] + t * (poly[i + 1][1] - poly[i][1]),
+            )
+        total += seg
+    return poly[-1]
+
+
+@router.get("/{track_id}/segments/positions")
+async def get_segment_positions(
+    track_id: int,
+    segment: str,
+    count: int = Query(..., ge=1, le=500),
+    route_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Compute COUNT evenly spaced GPS positions along a segment's stretch of its
+    route polyline — exactly on the line (snap distance 0), ordered in walking
+    direction (start marker → end marker). Built for efficient bulk placement
+    of POIs/stations along a segment (e.g. art path sculptures, species): the
+    caller creates waypoints at the returned positions instead of hand-placing.
+
+    Params:
+    - segment: the segment name (metadata_json.segment.name of the marker pair)
+    - count: number of positions (distributed over count+1 equal intervals)
+    - route_id: optional override; default is the segment markers' routeId
+
+    Returns segment geometry info + positions[{index, latitude, longitude,
+    along_meters}]. Pure computation — nothing is created.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Find the segment marker pair by name
+    markers = [
+        wp for wp in db.query(Waypoint).filter(Waypoint.track_id == track_id).all()
+        if wp.metadata_json and (wp.metadata_json.get("segment") or {}).get("name") == segment
+    ]
+    start_wp = next((w for w in markers if (w.metadata_json.get("segment") or {}).get("role") == "start"), None)
+    end_wp = next((w for w in markers if (w.metadata_json.get("segment") or {}).get("role") == "end"), None)
+    if not start_wp or not end_wp:
+        raise HTTPException(status_code=404, detail=f"Segment '{segment}' has no complete start/end marker pair")
+
+    effective_route_id = route_id or (start_wp.metadata_json.get("segment") or {}).get("routeId")
+    _, polylines = _get_membership_geometry(db, track_id, track)
+
+    # If no routeId is tagged (or it has no polyline), fall back to the route
+    # whose polyline is closest to the start marker — segment tags can lag the
+    # geographic truth (lesson from issue #359).
+    poly = polylines.get(effective_route_id)
+    if not poly:
+        best = None
+        for rid, p in polylines.items():
+            d, _, _, _ = _closest_point_on_polyline(p, start_wp.latitude, start_wp.longitude)
+            if best is None or d < best[0]:
+                best = (d, rid, p)
+        if not best:
+            raise HTTPException(status_code=404, detail="Track has no route polylines")
+        effective_route_id, poly = best[1], best[2]
+
+    d0, s0, _, _ = _closest_point_on_polyline(poly, start_wp.latitude, start_wp.longitude)
+    d1, s1, _, _ = _closest_point_on_polyline(poly, end_wp.latitude, end_wp.longitude)
+
+    positions = []
+    for i in range(1, count + 1):
+        s = s0 + i * (s1 - s0) / (count + 1)
+        lat, lon = _point_at_along(poly, s)
+        positions.append({"index": i, "latitude": round(lat, 8), "longitude": round(lon, 8), "along_meters": round(s, 1)})
+
+    return {
+        "track_id": track_id,
+        "segment": segment,
+        "route_id": effective_route_id,
+        "start_waypoint_id": start_wp.id,
+        "end_waypoint_id": end_wp.id,
+        "segment_start_along_m": round(s0, 1),
+        "segment_end_along_m": round(s1, 1),
+        "length_m": round(abs(s1 - s0), 1),
+        "spacing_m": round(abs(s1 - s0) / (count + 1), 1),
+        "marker_snap_distances_m": [round(d0, 1), round(d1, 1)],
+        "count": count,
+        "positions": positions,
+    }
+
 
 @router.get("/{track_id}/routes/{route_id}/waypoint-ids")
 async def get_route_waypoint_ids(
