@@ -951,6 +951,8 @@ class WaypointUpdate(BaseModel):
     tags: Optional[List[str]] = None
     priority: Optional[float] = None  # -1.0 to 1.0, higher = more important
     metadata_json: Optional[dict] = None  # Full metadata override (merges with existing)
+    latitude: Optional[float] = None   # In-place move: change position, waypoint_id stays stable
+    longitude: Optional[float] = None
 
 # --- Chunked Uploads (optional) ---
 
@@ -1308,6 +1310,18 @@ async def update_waypoint(
                 meta["settings"] = pruned
             else:
                 meta.pop("settings", None)
+    # In-place move: change the position ON THE SAME ROW (waypoint_id stays
+    # stable, so Knowledge's locations[].waypoint_id bindings survive). The old
+    # snap block is now stale — drop it so rendering/membership fall back to the
+    # fresh raw lat/lon; route membership itself is preserved via fixedRoutes.
+    moved = False
+    if update.latitude is not None and update.longitude is not None:
+        waypoint.latitude = update.latitude
+        waypoint.longitude = update.longitude
+        if "snap" in meta:
+            meta.pop("snap", None)
+        moved = True
+
     waypoint.metadata_json = meta
     flag_modified(waypoint, "metadata_json")  # Explicitly mark JSON field as modified for SQLAlchemy
 
@@ -1318,7 +1332,27 @@ async def update_waypoint(
     waypoint.updated_at = datetime.utcnow()
     db.commit()
 
-    return {"message": "Waypoint updated"}
+    # Announce the move on the IACP event-bus so subscribers (Knowledge) can
+    # re-sync their locations[] lat/lon for this waypoint_id. Fire-and-forget:
+    # a bus hiccup must never fail the update. Carries the bound knowledge_ids
+    # so a consumer needn't re-query which knowledge objects to update.
+    if moved:
+        try:
+            from ..event_bus import publish_event
+            kids = meta.get("knowledge_ids") or ([meta["knowledge_id"]] if meta.get("knowledge_id") is not None else [])
+            await publish_event(
+                "artrack.waypoint_moved",
+                {"waypoint_id": waypoint_id, "track_id": waypoint.track_id,
+                 "latitude": waypoint.latitude, "longitude": waypoint.longitude,
+                 "knowledge_ids": kids},
+            )
+        except Exception:
+            logging.getLogger("artrack.waypoints").debug(
+                "waypoint_moved event publish skipped (non-fatal)", exc_info=True
+            )
+
+    return {"message": "Waypoint updated", "moved": moved,
+            "latitude": waypoint.latitude, "longitude": waypoint.longitude}
 
 
 # --- Knowledge-sighting clustering (non-destructive primary/secondary marking) ---
