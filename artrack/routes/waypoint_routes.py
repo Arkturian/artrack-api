@@ -945,7 +945,15 @@ async def list_waypoints(
 
     return waypoint_responses
 
+_WAYPOINT_TYPES_UPDATABLE = {"manual", "screen_point", "story_point", "narration_point"}
+
+
 class WaypointUpdate(BaseModel):
+    # Unknown fields are REJECTED (422) instead of silently accepted: a
+    # "200 but nothing happened" cost consumers repeated debugging rounds
+    # (waypoint_type and lat/lon were both silently dropped before).
+    model_config = {"extra": "forbid"}
+
     title: Optional[str] = None
     description: Optional[str] = None
     tags: Optional[List[str]] = None
@@ -953,6 +961,7 @@ class WaypointUpdate(BaseModel):
     metadata_json: Optional[dict] = None  # Full metadata override (merges with existing)
     latitude: Optional[float] = None   # In-place move: change position, waypoint_id stays stable
     longitude: Optional[float] = None
+    waypoint_type: Optional[str] = None  # Reclassify (manual|screen_point|story_point|narration_point; gps_track excluded)
 
 # --- Chunked Uploads (optional) ---
 
@@ -1310,6 +1319,22 @@ async def update_waypoint(
                 meta["settings"] = pruned
             else:
                 meta.pop("settings", None)
+    # Reclassify the waypoint type (e.g. curated stations screen_point→manual).
+    # gps_track is excluded both ways: converting to it would corrupt route
+    # polylines, converting from it would silently delete route geometry.
+    if update.waypoint_type is not None:
+        if update.waypoint_type not in _WAYPOINT_TYPES_UPDATABLE:
+            raise HTTPException(status_code=400, detail=f"Invalid waypoint_type '{update.waypoint_type}' (allowed: {sorted(_WAYPOINT_TYPES_UPDATABLE)})")
+        if waypoint.waypoint_type == "gps_track":
+            raise HTTPException(status_code=400, detail="gps_track points cannot be reclassified (route geometry)")
+        waypoint.waypoint_type = update.waypoint_type
+        # Keep the legacy metadata flag consistent: it mirrors the type for
+        # older readers, a stale true would keep screen-point rendering alive.
+        if update.waypoint_type == "screen_point":
+            meta["screen_point"] = True
+        else:
+            meta.pop("screen_point", None)
+
     # In-place move: change the position ON THE SAME ROW (waypoint_id stays
     # stable, so Knowledge's locations[].waypoint_id bindings survive). The old
     # snap block is now stale — drop it so rendering/membership fall back to the
