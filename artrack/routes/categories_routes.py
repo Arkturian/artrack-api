@@ -51,6 +51,19 @@ POI_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "anekdote": {"bezeichnung": "Anekdote", "icon": "💬"},
         }
     },
+    "kunst": {
+        # Art-path exhibits (e.g. Anna-Sacher sculptures, Kunstpfad track 30):
+        # curated artworks placed along a segment, usually knowledge-linked.
+        "bezeichnung": "Kunst",
+        "farbe": "#B45309",
+        "icon": "🗿",
+        "unterkategorien": {
+            "skulptur": {"bezeichnung": "Skulptur", "icon": "🗿"},
+            "installation": {"bezeichnung": "Installation", "icon": "🎨"},
+            "kunstwerk": {"bezeichnung": "Kunstwerk", "icon": "🖼️"},
+            "kunstplatz": {"bezeichnung": "Kunstplatz", "icon": "⛲"},
+        }
+    },
     "navigation": {
         "bezeichnung": "Navigation",
         "farbe": "#3B82F6",

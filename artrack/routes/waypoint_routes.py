@@ -107,6 +107,7 @@ async def create_waypoints(
                 status="existing"
             )
         else:
+            _validate_category((waypoint_data.metadata_json or {}).get("category"), track)
             # Create new waypoint
             db_waypoint = Waypoint(
                 client_waypoint_id=waypoint_data.client_waypoint_id,
@@ -948,6 +949,37 @@ async def list_waypoints(
 _WAYPOINT_TYPES_UPDATABLE = {"manual", "screen_point", "story_point", "narration_point"}
 
 
+def _validate_category(category, track) -> None:
+    """Fail-closed category check at WRITE time (422 with the valid keys).
+
+    A silently accepted unknown category only surfaces days later as a generic
+    map-pin fallback on the hike (Anna-Sacher/'kunst' incident, 2026-07-25).
+    Valid = global registry (categories_routes.POI_CATEGORIES) plus the track's
+    own extension list (track.metadata_json.custom_categories) so tenant tracks
+    (e.g. Udo: biografie/ausbildung/…) can use domain categories without
+    polluting the global registry.
+    """
+    if category is None or category == "":
+        return
+    from .categories_routes import POI_CATEGORIES
+    allowed = set(POI_CATEGORIES.keys())
+    try:
+        custom = ((track.metadata_json or {}).get("custom_categories") or []) if track is not None else []
+        allowed.update(c for c in custom if isinstance(c, str))
+    except Exception:
+        pass
+    if category not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unknown_category",
+                "category": category,
+                "valid_categories": sorted(allowed),
+                "hint": "Register the category in /categories (global registry) or add it to track.metadata_json.custom_categories",
+            },
+        )
+
+
 class WaypointUpdate(BaseModel):
     # Unknown fields are REJECTED (422) instead of silently accepted: a
     # "200 but nothing happened" cost consumers repeated debugging rounds
@@ -1275,6 +1307,8 @@ async def update_waypoint(
     # Merge metadata_json if provided (deep merge for nested objects like segment)
     if update.metadata_json is not None:
         incoming = dict(update.metadata_json)
+        if "category" in incoming:
+            _validate_category(incoming.get("category"), track)
         # Defensive: preserve each asset's storage_host across an assets-list
         # replacement. Clients (dashboard editor, MCP waypoint_update) frequently
         # resend assets as {id, role} WITHOUT the host marker; without this carry-
