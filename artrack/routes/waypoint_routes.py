@@ -1224,7 +1224,13 @@ async def get_waypoint_detail(
         moderation_status=waypoint.moderation_status,
         waypoint_type=waypoint.waypoint_type,
         metadata_json=_meta,
-        media=media
+        media=media,
+        # These were silently omitted → the model defaults (None) masked the real
+        # DB values; waypoint_get said priority=null while slim said 0.0 for the
+        # same row (Tschepp-clone find, 2026-07-27). Endpoints must agree.
+        priority=getattr(waypoint, "priority", None),
+        route_id=getattr(waypoint, "route_id", None),
+        segment_id=getattr(waypoint, "segment_id", None),
     )
 
 # --- Per-POI generic settings (metadata_json.settings) ----------------------
