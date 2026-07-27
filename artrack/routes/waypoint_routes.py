@@ -1521,11 +1521,15 @@ async def attach_storage_to_waypoint(
     attached_ids: list = []
     skipped_items: list = []
     for sid in (body.storageIds or []):
+        # Savepoint per item: a constraint error on one id must neither poison
+        # the session nor roll back the other attachments of this batch.
+        sp = db.begin_nested()
         try:
             sid = int(sid)
             # Skip if already attached
             existing = db.query(MediaFile).filter(MediaFile.waypoint_id == waypoint_id, MediaFile.storage_object_id == sid).first()
             if existing:
+                sp.rollback()
                 skipped_items.append({"id": sid, "reason": "already_attached"})
                 continue
 
@@ -1570,8 +1574,23 @@ async def attach_storage_to_waypoint(
                     except Exception:
                         continue
                 if not host:
+                    sp.rollback()
                     skipped_items.append({"id": sid, "reason": "not_found_in_storage (weder arkserver noch arkturian liefern das Objekt)"})
                     continue
+                # Recreate the mirror row from the probe: media_files carries an
+                # FK onto storage_objects, and the arkserver mirror is empty —
+                # without this the commit dies on the constraint. Doubles as a
+                # cache repopulation for legacy readers of storage_objects.
+                mirror = StorageObject(
+                    id=sid,
+                    file_url=f"{host}/storage/media/{sid}",
+                    thumbnail_url=f"{host}/storage/media/{sid}?variant=thumbnail&format=jpg",
+                    mime_type=mime,
+                    file_size_bytes=size,
+                    is_public=True,
+                )
+                db.add(mirror)
+                db.flush()
                 is_media = (mime or "").split("/")[0] in ("image", "video", "audio")
                 mf = MediaFile(
                     waypoint_id=waypoint_id,
@@ -1588,8 +1607,13 @@ async def attach_storage_to_waypoint(
                     metadata_json={"storage_host": host, "attached_via": "live_lookup"}
                 )
             db.add(mf)
+            sp.commit()
             attached_ids.append(sid)
         except Exception as e:
+            try:
+                sp.rollback()
+            except Exception:
+                pass
             skipped_items.append({"id": sid, "reason": f"error: {type(e).__name__}"})
     db.commit()
     # counts stay backward-compatible; ids/reasons kill the silent-skip class
