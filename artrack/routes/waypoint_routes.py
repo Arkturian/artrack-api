@@ -1592,13 +1592,16 @@ async def attach_storage_to_waypoint(
                 db.add(mirror)
                 db.flush()
                 is_media = (mime or "").split("/")[0] in ("image", "video", "audio")
+                # png thumbs for png sources: format=jpg flattens transparency
+                # (cut-out illustrations) onto a black square
+                thumb_fmt = "png" if (mime or "") == "image/png" else "jpg"
                 mf = MediaFile(
                     waypoint_id=waypoint_id,
                     media_type=body.mediaType or ((mime or "").split("/")[0] if is_media else "photo"),
                     original_filename=None,
                     file_path=None,
                     file_url=f"{host}/storage/media/{sid}",
-                    thumbnail_url=f"{host}/storage/media/{sid}?variant=thumbnail&format=jpg",
+                    thumbnail_url=f"{host}/storage/media/{sid}?variant=thumbnail&format={thumb_fmt}",
                     file_size_bytes=size,
                     mime_type=mime,
                     checksum=None,

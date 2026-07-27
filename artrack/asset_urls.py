@@ -21,13 +21,15 @@ from typing import Any, Optional
 from .config import settings
 
 
-def _media_url(host: str, asset_id: Any, variant: Optional[str] = None) -> str:
+def _media_url(host: str, asset_id: Any, variant: Optional[str] = None, thumb_format: str = "jpg") -> str:
     base = f"{host.rstrip('/')}/storage/media/{asset_id}"
     if variant == "thumbnail":
-        # format=jpg is REQUIRED for video assets (the storage endpoint extracts a
-        # frame; without it videos return the raw stream / content-length 0 and the
-        # client's loadImage fails). It is harmless for images (forces a jpg thumb).
-        return f"{base}?variant=thumbnail&format=jpg"
+        # A format IS REQUIRED for video assets (the storage endpoint extracts a
+        # frame; without it videos return the raw stream / content-length 0 and
+        # the client's loadImage fails). BUT jpg is NOT harmless for images:
+        # it flattens transparent PNGs (cut-out icons) onto a black square —
+        # icon-role assets therefore get png (Tschepp find, Anna-Sacher 2026-07-27).
+        return f"{base}?variant=thumbnail&format={thumb_format}"
     return f"{base}?variant={variant}" if variant else base
 
 
@@ -48,9 +50,11 @@ def enrich_asset(asset: dict) -> dict:
     host = out.get("storage_host") or settings.STORAGE_DEFAULT_HOST
     out.setdefault("file_url", _media_url(host, aid))
     # thumbnail_url is ALWAYS recomputed from storage_host (not setdefault): stored
-    # thumbnail_urls were frequently host-stale and/or missing format=jpg (videos
-    # then 404/empty → broken thumbs). Recomputing makes them host-correct + jpg.
-    out["thumbnail_url"] = _media_url(host, aid, "thumbnail")
+    # thumbnail_urls were frequently host-stale and/or missing the format param
+    # (videos then 404/empty → broken thumbs). Recomputing makes them host-correct.
+    # Icon-role assets are by convention cut-out images → png keeps the alpha.
+    thumb_format = "png" if out.get("role") == "icon" else "jpg"
+    out["thumbnail_url"] = _media_url(host, aid, "thumbnail", thumb_format=thumb_format)
     return out
 
 
