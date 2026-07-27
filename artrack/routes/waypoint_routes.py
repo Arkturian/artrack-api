@@ -302,6 +302,14 @@ async def list_waypoints_detail(
                 # the target story already at first paint, before hydration.
                 "story_group": md.get("story_group"),
                 "story_id": md.get("story_id"),
+                # Route membership layers 1+2 (issue: route filter fell back to
+                # client geometry until hydration — Post #4359). fixedRoutes is
+                # the curated membership (highest authority), snap_primary_route_id
+                # the snap result as a single int (full snap block stays
+                # hydration-only). With both, the slim first paint can already
+                # filter routes exactly like the server does.
+                "fixedRoutes": md.get("fixedRoutes"),
+                "snap_primary_route_id": (md.get("snap") or {}).get("primary_route_id"),
             })
         return slim
 
