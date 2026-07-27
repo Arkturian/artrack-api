@@ -1334,9 +1334,20 @@ async def update_waypoint(
                 for a in (meta.get("assets") or [])
                 if isinstance(a, dict) and a.get("id") is not None and a.get("storage_host")
             }
+            # mime_type rides along like storage_host: enrich_asset picks the
+            # thumbnail format from it (image → native/alpha-preserving, video →
+            # jpg frame). Clients resend assets as {id, role} — without the
+            # carry-over the field would be lost on every edit.
+            old_mimes = {
+                a["id"]: a["mime_type"]
+                for a in (meta.get("assets") or [])
+                if isinstance(a, dict) and a.get("id") is not None and a.get("mime_type")
+            }
             for a in incoming["assets"]:
                 if isinstance(a, dict) and a.get("id") in old_hosts and not a.get("storage_host"):
                     a["storage_host"] = old_hosts[a["id"]]
+                if isinstance(a, dict) and a.get("id") in old_mimes and not a.get("mime_type"):
+                    a["mime_type"] = old_mimes[a["id"]]
             # Genuinely new asset with no host and no prior record → best-effort
             # probe the alternate (arkserver) host so consumers needn't know it.
             for a in incoming["assets"]:

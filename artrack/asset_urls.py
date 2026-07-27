@@ -21,15 +21,19 @@ from typing import Any, Optional
 from .config import settings
 
 
-def _media_url(host: str, asset_id: Any, variant: Optional[str] = None, thumb_format: str = "jpg") -> str:
+def _media_url(host: str, asset_id: Any, variant: Optional[str] = None, thumb_format: Optional[str] = "jpg") -> str:
     base = f"{host.rstrip('/')}/storage/media/{asset_id}"
     if variant == "thumbnail":
         # A format IS REQUIRED for video assets (the storage endpoint extracts a
         # frame; without it videos return the raw stream / content-length 0 and
-        # the client's loadImage fails). BUT jpg is NOT harmless for images:
-        # it flattens transparent PNGs (cut-out icons) onto a black square —
-        # icon-role assets therefore get png (Tschepp find, Anna-Sacher 2026-07-27).
-        return f"{base}?variant=thumbnail&format={thumb_format}"
+        # the client's loadImage fails). BUT forcing a format is NOT harmless for
+        # images: jpg flattens transparent PNGs onto a black square. Without a
+        # format param the storage API returns the NATIVE image format (alpha
+        # preserved — that is how flora thumbnails always worked). thumb_format
+        # None therefore means "native".
+        if thumb_format:
+            return f"{base}?variant=thumbnail&format={thumb_format}"
+        return f"{base}?variant=thumbnail"
     return f"{base}?variant={variant}" if variant else base
 
 
@@ -52,8 +56,21 @@ def enrich_asset(asset: dict) -> dict:
     # thumbnail_url is ALWAYS recomputed from storage_host (not setdefault): stored
     # thumbnail_urls were frequently host-stale and/or missing the format param
     # (videos then 404/empty → broken thumbs). Recomputing makes them host-correct.
-    # Icon-role assets are by convention cut-out images → png keeps the alpha.
-    thumb_format = "png" if out.get("role") == "icon" else "jpg"
+    # Format choice: the criterion is the SOURCE's alpha, not the role (Tschepp,
+    # 2026-07-27 — a cut-out MAIN image flattens on jpg exactly like an icon):
+    #  - known video mime          → jpg (frame extraction needs a format)
+    #  - known image mime          → native (no format param; alpha preserved)
+    #  - unknown mime, role=icon   → png (icons are cut-outs by convention)
+    #  - unknown mime otherwise    → jpg (safe default: could be a video)
+    mime = out.get("mime_type") or ""
+    if mime.startswith("video"):
+        thumb_format: Optional[str] = "jpg"
+    elif mime.startswith("image"):
+        thumb_format = None
+    elif out.get("role") == "icon":
+        thumb_format = "png"
+    else:
+        thumb_format = "jpg"
     out["thumbnail_url"] = _media_url(host, aid, "thumbnail", thumb_format=thumb_format)
     return out
 
