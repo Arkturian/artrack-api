@@ -1518,39 +1518,83 @@ async def attach_storage_to_waypoint(
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
     if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
         raise HTTPException(status_code=403, detail="Access denied")
-    attached = 0
-    skipped = 0
+    attached_ids: list = []
+    skipped_items: list = []
     for sid in (body.storageIds or []):
         try:
-            so = db.query(StorageObject).filter(StorageObject.id == int(sid)).first()
-            if not so:
-                skipped += 1
-                continue
+            sid = int(sid)
             # Skip if already attached
-            existing = db.query(MediaFile).filter(MediaFile.waypoint_id == waypoint_id, MediaFile.storage_object_id == so.id).first()
+            existing = db.query(MediaFile).filter(MediaFile.waypoint_id == waypoint_id, MediaFile.storage_object_id == sid).first()
             if existing:
-                skipped += 1
+                skipped_items.append({"id": sid, "reason": "already_attached"})
                 continue
-            mf = MediaFile(
-                waypoint_id=waypoint_id,
-                media_type=body.mediaType or (so.mime_type.split('/')[0] if (so.mime_type or '').find('/')>0 else 'photo'),
-                original_filename=so.original_filename,
-                file_path=str(generic_storage.absolute_path_for_key(so.object_key)) if getattr(so, 'object_key', None) else None,
-                file_url=so.file_url,
-                thumbnail_url=so.thumbnail_url,
-                file_size_bytes=so.file_size_bytes,
-                mime_type=so.mime_type,
-                checksum=so.checksum,
-                processing_state="uploaded",
-                storage_object_id=so.id,
-                metadata_json={}
-            )
+
+            so = db.query(StorageObject).filter(StorageObject.id == sid).first()
+            if so:
+                mf = MediaFile(
+                    waypoint_id=waypoint_id,
+                    media_type=body.mediaType or (so.mime_type.split('/')[0] if (so.mime_type or '').find('/')>0 else 'photo'),
+                    original_filename=so.original_filename,
+                    file_path=str(generic_storage.absolute_path_for_key(so.object_key)) if getattr(so, 'object_key', None) else None,
+                    file_url=so.file_url,
+                    thumbnail_url=so.thumbnail_url,
+                    file_size_bytes=so.file_size_bytes,
+                    mime_type=so.mime_type,
+                    checksum=so.checksum,
+                    processing_state="uploaded",
+                    storage_object_id=so.id,
+                    metadata_json={}
+                )
+            else:
+                # Live fallback: the local storage_objects mirror only covers
+                # ArTrack's OWN uploads (and is empty on the arkserver instance
+                # post-migration) — objects uploaded by other services
+                # (Knowledge illustrations etc.) live only in the storage-api.
+                # Probe both hosts and attach with absolute, host-correct URLs.
+                host = None
+                mime = None
+                size = None
+                for cand in (settings.STORAGE_ALT_HOST if hasattr(settings, "STORAGE_ALT_HOST") else "https://api-storage.arkserver.arkturian.com",
+                             "https://api-storage.arkturian.com"):
+                    try:
+                        async with httpx.AsyncClient(timeout=3.0) as client:
+                            r = await client.head(f"{cand}/storage/media/{sid}")
+                            if r.status_code == 200:
+                                host = cand
+                                mime = r.headers.get("content-type")
+                                try:
+                                    size = int(r.headers.get("content-length") or 0) or None
+                                except (TypeError, ValueError):
+                                    size = None
+                                break
+                    except Exception:
+                        continue
+                if not host:
+                    skipped_items.append({"id": sid, "reason": "not_found_in_storage (weder arkserver noch arkturian liefern das Objekt)"})
+                    continue
+                is_media = (mime or "").split("/")[0] in ("image", "video", "audio")
+                mf = MediaFile(
+                    waypoint_id=waypoint_id,
+                    media_type=body.mediaType or ((mime or "").split("/")[0] if is_media else "photo"),
+                    original_filename=None,
+                    file_path=None,
+                    file_url=f"{host}/storage/media/{sid}",
+                    thumbnail_url=f"{host}/storage/media/{sid}?variant=thumbnail&format=jpg",
+                    file_size_bytes=size,
+                    mime_type=mime,
+                    checksum=None,
+                    processing_state="uploaded",
+                    storage_object_id=sid,
+                    metadata_json={"storage_host": host, "attached_via": "live_lookup"}
+                )
             db.add(mf)
-            attached += 1
-        except Exception:
-            skipped += 1
+            attached_ids.append(sid)
+        except Exception as e:
+            skipped_items.append({"id": sid, "reason": f"error: {type(e).__name__}"})
     db.commit()
-    return {"attached": attached, "skipped": skipped}
+    # counts stay backward-compatible; ids/reasons kill the silent-skip class
+    return {"attached": len(attached_ids), "skipped": len(skipped_items),
+            "attached_ids": attached_ids, "skipped_items": skipped_items}
 
 # Delete a waypoint and its media records (files left intact for now)
 @router.delete("/waypoints/{waypoint_id}")
