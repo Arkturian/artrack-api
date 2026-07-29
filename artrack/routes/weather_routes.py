@@ -110,6 +110,59 @@ def _build_payload(lat: float, lon: float, location: str, cur: dict) -> dict:
     }
 
 
+_WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+
+
+def _forecast_day_text(day_label: str, weekday: str, condition: str, tmin, tmax, precip_mm, precip_prob) -> str:
+    """One ready-to-speak sentence per forecast day (the voice guide reads it verbatim)."""
+    temp_part = f"{round(tmin)} bis {round(tmax)} Grad" if tmin is not None and tmax is not None else ""
+    if (precip_mm or 0) <= 0 and (precip_prob or 0) < 20:
+        rain_part = "kein Regen"
+    elif (precip_mm or 0) <= 0:
+        rain_part = f"{precip_prob} Prozent Regenwahrscheinlichkeit"
+    else:
+        rain_part = f"{precip_mm:g} mm Regen ({precip_prob} Prozent Wahrscheinlichkeit)"
+    lead = f"{day_label}, {weekday}" if day_label else weekday
+    parts = [p for p in (condition, temp_part, rain_part) if p]
+    return f"{lead}: {', '.join(parts)}."
+
+
+def _build_forecast(daily: dict) -> list:
+    """Map open-meteo daily arrays into per-day dicts with German text."""
+    from datetime import date as _date
+    out = []
+    dates = daily.get("time") or []
+    for i, ds in enumerate(dates):
+        try:
+            d = _date.fromisoformat(ds)
+        except (TypeError, ValueError):
+            continue
+        offset = (d - _date.today()).days
+        if offset < 1:
+            continue  # today is covered by the current-conditions block
+        day_label = "Morgen" if offset == 1 else ("Übermorgen" if offset == 2 else "")
+        weekday = _WEEKDAYS_DE[d.weekday()]
+        code = int((daily.get("weather_code") or [None] * len(dates))[i] or -1)
+        condition, emoji = _WMO.get(code, ("unbekannt", "🌡️"))
+        tmin = (daily.get("temperature_2m_min") or [None] * len(dates))[i]
+        tmax = (daily.get("temperature_2m_max") or [None] * len(dates))[i]
+        precip = (daily.get("precipitation_sum") or [0] * len(dates))[i] or 0.0
+        prob = (daily.get("precipitation_probability_max") or [0] * len(dates))[i] or 0
+        out.append({
+            "date": ds,
+            "weekday": weekday,
+            "temp_min_c": tmin,
+            "temp_max_c": tmax,
+            "precipitation_mm": precip,
+            "precipitation_probability": prob,
+            "weather_code": code,
+            "condition": condition,
+            "emoji": emoji,
+            "text": _forecast_day_text(day_label, weekday, condition, tmin, tmax, precip, prob),
+        })
+    return out
+
+
 @router.get("")
 async def get_weather(
     lat: float = Query(DEFAULT_LAT, description="Latitude (default: Tscheppaschlucht center)"),
@@ -119,31 +172,45 @@ async def get_weather(
         description="Display name used in the `text` line; defaults to 'Tscheppaschlucht' "
         "for the default coordinates, else 'Umgebung'",
     ),
+    forecast_days: int = Query(
+        0, ge=0, le=7,
+        description="Additionally return `forecast[]` for the next N days (starting tomorrow). "
+        "0 (default) keeps the response byte-identical to before — current conditions only.",
+    ),
 ):
-    """Current weather with German condition text + ready-to-inject `text` line."""
+    """Current weather with German condition text + ready-to-inject `text` line.
+
+    With ?forecast_days=N the response additionally carries `forecast[]` — one
+    entry per upcoming day (starting tomorrow) with min/max temperature,
+    precipitation, condition and a ready-to-speak German `text` sentence
+    (\"Soll ich morgen kommen?\" — the voice guide reads it verbatim)."""
     if location is None:
         is_default = abs(lat - DEFAULT_LAT) < 0.01 and abs(lon - DEFAULT_LON) < 0.01
         location = DEFAULT_LOCATION if is_default else "Umgebung"
 
-    key = (round(lat, 3), round(lon, 3))
+    key = (round(lat, 3), round(lon, 3), forecast_days)
     now = time.time()
     cached = _CACHE.get(key)
     if cached and now - cached[0] < _CACHE_TTL:
         return cached[1]
 
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,precipitation,weather_code,wind_speed_10m",
+        "timezone": "Europe/Vienna",
+    }
+    if forecast_days > 0:
+        # +1: open-meteo counts today as day 1, our forecast[] starts tomorrow
+        params["daily"] = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max"
+        params["forecast_days"] = forecast_days + 1
+
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(
-                OPEN_METEO_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,precipitation,weather_code,wind_speed_10m",
-                    "timezone": "Europe/Vienna",
-                },
-            )
+            resp = await client.get(OPEN_METEO_URL, params=params)
             resp.raise_for_status()
-            cur = resp.json().get("current") or {}
+            data = resp.json()
+            cur = data.get("current") or {}
     except Exception as e:
         if cached:
             # Stale beats nothing mid-hike; the payload still carries observed_at.
@@ -152,6 +219,8 @@ async def get_weather(
         raise HTTPException(status_code=502, detail=f"Weather source unreachable: {e}")
 
     payload = _build_payload(lat, lon, location, cur)
+    if forecast_days > 0:
+        payload["forecast"] = _build_forecast(data.get("daily") or {})
     _CACHE[key] = (now, payload)
     if len(_CACHE) > 256:  # bound the cache (grid keys are effectively finite anyway)
         _CACHE.pop(next(iter(_CACHE)))
