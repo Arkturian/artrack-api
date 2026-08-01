@@ -20,6 +20,7 @@ from .track_report_generator import generate_track_report
 # cache-miss, in-process TTL cache keyed by knowledge_id, best-effort: any error
 # → empty result → no marker, never fails the response (hot-path-safe).
 import os as _os
+from artrack.collaboration_models import can_read_track
 _HAS3D_CACHE: dict = {}            # knowledge_id(int) -> (expiry_epoch, bool)
 _HAS3D_TTL = 900.0                  # 15 min
 _KNOWLEDGE_API_BASE = _os.getenv("ARTRACK_KNOWLEDGE_API_BASE", "https://knowledge-api.arkturian.com")
@@ -451,7 +452,7 @@ async def list_routes(track_id: int, db: Session = Depends(get_db), current_user
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
     routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
     return [RouteItem(id=r.id, track_id=r.track_id, name=r.name, color=r.color, description=r.description, storage_object_ids=getattr(r, 'storage_object_ids', None), storage_collection=getattr(r, 'storage_collection', None), created_at=r.created_at) for r in routes]
@@ -475,7 +476,7 @@ async def get_route_overview(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get route
@@ -625,7 +626,7 @@ async def get_segment_positions(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Find the segment marker pair by name
@@ -695,7 +696,7 @@ async def get_route_waypoint_ids(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     route = db.query(TrackRouteModel).filter(
@@ -744,7 +745,7 @@ async def get_route_detail(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get route
@@ -1003,7 +1004,7 @@ async def get_track_structure_report(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Generate report using shared logic
@@ -1033,7 +1034,7 @@ async def get_track_routes_overview(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for this track
@@ -1375,7 +1376,7 @@ async def get_all_pois_pretty(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for distance calculations
@@ -1492,7 +1493,7 @@ async def get_pois_near(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # 1. Build polylines per route (for snapping) — cached in-process per track.
@@ -2166,7 +2167,7 @@ async def get_all_segments_pretty(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for distance calculations
@@ -2287,7 +2288,7 @@ async def get_route_ids(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
@@ -2313,7 +2314,7 @@ async def get_track_pretty(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
@@ -2392,7 +2393,7 @@ async def get_route_pretty(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     route = db.query(TrackRouteModel).filter(
