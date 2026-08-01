@@ -3,11 +3,13 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional, Tuple
 from datetime import datetime
+import logging
 import math
 import time
 
 from ..database import get_db
 from ..auth import get_current_user
+from ..config import settings
 from ..models import Track, TrackRoute as TrackRouteModel, Waypoint
 from ..asset_urls import enrich_asset, resolve_audio_url, resolve_hls_url
 from pydantic import BaseModel
@@ -58,6 +60,7 @@ async def _get_has_3d(knowledge_ids) -> dict:
     return out
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Helper function to calculate distance
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -1008,12 +1011,19 @@ async def get_track_structure_report(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Generate report using shared logic
-    report_text = generate_track_report(
-        track_id=track_id,
-        show_descriptions=full,
-        api_key="Inetpass1",
-        base_url="https://api.arkturian.com/artrack"
-    )
+    try:
+        report_text = generate_track_report(
+            track_id=track_id,
+            show_descriptions=full,
+            api_key=settings.API_KEY,
+            base_url=settings.AI_BASE_URL.rstrip("/"),
+        )
+    except Exception as exc:
+        logger.exception("Failed to generate structure report for track %s", track_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Track structure report could not be generated.",
+        ) from exc
 
     return PlainTextResponse(report_text)
 
@@ -2700,4 +2710,3 @@ async def get_waypoints_by_knowledge(
             "source_collection": meta.get("source_collection"),
         })
     return {"knowledge_id": knowledge_id, "count": len(out), "primary_only": primary_only, "waypoints": out}
-
