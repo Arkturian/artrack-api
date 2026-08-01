@@ -204,20 +204,18 @@ def register_user(db: Session, user_create: UserCreate) -> AuthResponse:
 def _ensure_firebase_admin_initialized():
     try:
         import firebase_admin
-        from firebase_admin import credentials
+        from google.auth.credentials import AnonymousCredentials
         try:
             firebase_admin.get_app()
         except ValueError:
-            # Try application default credentials; requires GOOGLE_APPLICATION_CREDENTIALS env var
-            try:
-                cred = credentials.ApplicationDefault()
-            except Exception:
-                cred = None
-            if cred is not None:
-                firebase_admin.initialize_app(cred)
-            else:
-                # Initialize without explicit credentials (may work in some environments)
-                firebase_admin.initialize_app()
+            # ID-token verification only fetches Google's public signing keys.
+            # AnonymousCredentials keeps this verification-only service from
+            # depending on ADC or a service-account secret while projectId
+            # still enforces the expected Firebase audience and issuer.
+            firebase_admin.initialize_app(
+                AnonymousCredentials(),
+                options={"projectId": settings.FIREBASE_PROJECT_ID}
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Firebase admin init failed: {e}")
 
