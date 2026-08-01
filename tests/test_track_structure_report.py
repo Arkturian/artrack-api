@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from artrack.routes import routes_routes
+from artrack.routes import track_report_generator
 
 
 class _Query:
@@ -76,3 +77,36 @@ def test_structure_report_converts_generator_failure_to_bad_gateway(monkeypatch)
 
     assert raised.value.status_code == 502
     assert raised.value.detail == "Track structure report could not be generated."
+
+
+def test_waypoint_summary_is_read_only_and_excludes_gps(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def raise_for_status(self):
+            captured["checked_status"] = True
+
+        def json(self):
+            return [
+                {"waypoint_type": "gps_track", "segment_role": None},
+                {"waypoint_type": "manual", "segment_role": None},
+                {"waypoint_type": "screen_point", "segment_role": "start"},
+                {"waypoint_type": "story_point", "segment_role": None},
+            ]
+
+    def fake_get(url, **kwargs):
+        captured.update({"url": url, **kwargs})
+        return _Response()
+
+    monkeypatch.setattr(track_report_generator.requests, "get", fake_get)
+
+    summary = track_report_generator.load_waypoint_summary(
+        "http://127.0.0.1:8001",
+        30,
+        {"X-API-KEY": "configured-key"},
+    )
+
+    assert summary == {"total": 3, "skipped": 1}
+    assert captured["url"] == "http://127.0.0.1:8001/tracks/30/waypoints/detail"
+    assert captured["params"] == {"fields": "slim", "limit": 200000, "offset": 0}
+    assert captured["checked_status"] is True
