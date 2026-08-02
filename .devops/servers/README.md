@@ -1,5 +1,45 @@
 # Server Configurations
 
+> ## ⚠️ Fuer artrack-api NICHT benutzt
+>
+> **Legt hier keine Server-Datei an.** Die Skripte `deploy-to-server.sh`,
+> `setup-server.sh` und `cleanup-server.sh` sind fuer dieses Repo nicht der Weg.
+>
+> **Ausgerollt wird ueber GitHub Actions**, ausgeloest durch Push auf `main`
+> (`.github/workflows/deploy.yml`). Der Workflow hat Ziel und Dienst fest
+> verdrahtet:
+>
+> ```
+> DEPLOY_PATH  /var/www/api-artrack.arkserver.arkturian.com
+> Dienst       sudo -n systemctl restart artrack-api
+> ```
+>
+> Der uebliche Weg ist `./devops release` (fast-forward dev -> main, Push).
+>
+> ### Warum hier nichts mehr steht (2026-08-02)
+>
+> Es lag eine `arkserver.yaml` hier, die eine **unveraenderte Kopie der
+> storage-api-Konfiguration** war — Vorlagen-Rest aus dem Starterpack, nie
+> angepasst:
+>
+> ```yaml
+> deploy_path: "/var/www/storage-api"     # falsches Verzeichnis
+> service:  name: "storage-api"           # FREMDER Produktivdienst
+> nginx:    server_name: "storage-api.arkserver.arkturian.com"
+> ```
+>
+> Ein `deploy-to-server.sh --server arkserver` haette also artrack-api in das
+> Verzeichnis von storage-api gelegt und danach **storage-api neu gestartet** —
+> ein Dienst, mit dem dieses Repo nichts zu tun hat. `cleanup-server.sh`
+> haette dort geloescht. Beides ohne Warnung, weil die Konfiguration aus Sicht
+> der Skripte stimmig aussieht.
+>
+> Entfernt statt korrigiert: Ohne Datei bricht das Skript laut ab, und es gibt
+> weiterhin genau EINEN Deploy-Weg. Dieselbe Vorlagen-Datei lag mit demselben
+> falschen Inhalt auch in tschepp-ar-web und ist dort ebenfalls entfernt.
+>
+> Alles ab hier ist unveraenderter Starterpack-Text und gilt fuer andere Repos.
+
 This directory contains YAML configuration files for deployment targets.
 
 ## Structure
