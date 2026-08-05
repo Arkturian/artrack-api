@@ -5,6 +5,27 @@ import requests
 import math
 
 
+def load_waypoint_summary(base_url, track_id, headers):
+    """Load report counters without mutating or re-snapping track content."""
+    response = requests.get(
+        f"{base_url}/tracks/{track_id}/waypoints/detail",
+        headers=headers,
+        params={"fields": "slim", "limit": 200000, "offset": 0},
+    )
+    response.raise_for_status()
+    waypoints = response.json()
+    if not isinstance(waypoints, list):
+        raise ValueError("Waypoint detail endpoint returned an unexpected payload.")
+
+    report_waypoints = [
+        waypoint
+        for waypoint in waypoints
+        if waypoint.get("waypoint_type") != "gps_track"
+    ]
+    skipped = sum(bool(waypoint.get("segment_role")) for waypoint in report_waypoints)
+    return {"total": len(report_waypoints), "skipped": skipped}
+
+
 def closest_point_on_polyline(poly, lat, lon):
     """Calculate closest point on polyline to given coordinate"""
     if len(poly) < 2:
@@ -240,18 +261,16 @@ def generate_track_report(track_id, show_descriptions=False, api_key="Inetpass1"
     output.append("🔍 ALL WAYPOINTS IN TRACK")
     output.append("-" * 80)
 
-    resnap_resp = requests.post(
-        f"{base_url}/tracks/{track_id}/resnap-waypoints",
-        headers=headers,
-        json={"dryRun": True}
-    )
-    resnap = resnap_resp.json()
+    waypoint_summary = load_waypoint_summary(base_url, track_id, headers)
 
-    output.append(f"  Total waypoints: {resnap['total']}")
-    output.append(f"  Segment markers (skipped): {resnap['skipped']}")
-    output.append(f"  POIs: {resnap['total'] - resnap['skipped']}")
+    output.append(f"  Total waypoints: {waypoint_summary['total']}")
+    output.append(f"  Segment markers (skipped): {waypoint_summary['skipped']}")
+    output.append(f"  POIs: {waypoint_summary['total'] - waypoint_summary['skipped']}")
     output.append(f"  POIs assigned to routes: {total_pois_assigned}")
-    output.append(f"  POIs UNASSIGNED: {resnap['total'] - resnap['skipped'] - total_pois_assigned}")
+    output.append(
+        "  POIs UNASSIGNED: "
+        f"{waypoint_summary['total'] - waypoint_summary['skipped'] - total_pois_assigned}"
+    )
     output.append("")
 
     # Overlapping sections
@@ -333,8 +352,9 @@ def generate_track_report(track_id, show_descriptions=False, api_key="Inetpass1"
         if len(gps_points) == 0:
             issues.append(f"Route {route_id} ({route['name']}): NO GPS DATA")
 
-    if total_pois_assigned < (resnap['total'] - resnap['skipped']):
-        unassigned = resnap['total'] - resnap['skipped'] - total_pois_assigned
+    poi_total = waypoint_summary['total'] - waypoint_summary['skipped']
+    if total_pois_assigned < poi_total:
+        unassigned = poi_total - total_pois_assigned
         issues.append(f"{unassigned} POIs sind NICHT zugewiesen (zeigen auf ALLEN Routes in iOS)")
 
     if issues:

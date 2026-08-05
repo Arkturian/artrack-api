@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # File-based job storage (shared between workers)
 import os
 import tempfile
+from artrack.collaboration_models import can_read_track
 
 JOBS_FILE = "/tmp/artrack_generation_jobs.json"
 
@@ -477,7 +478,7 @@ def get_track_knowledge(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    if track.visibility == "private" and track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Load structural data (route/segment/poi names, IDs)
@@ -842,7 +843,7 @@ def get_knowledge_version(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    if track.visibility == "private" and track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Load track data

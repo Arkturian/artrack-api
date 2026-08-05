@@ -268,3 +268,54 @@ def get_user_permissions(track, user_id: int) -> TrackPermissions:
         is_owner=False,
         role=collaborator.role
     )
+
+
+# Trust-Stufen, die ueber die Track-Sichtbarkeit hinweg lesen duerfen.
+MODERATION_TRUST_LEVELS = ("admin", "moderator")
+
+
+def can_read_track(track, user) -> bool:
+    """Darf dieser Nutzer diesen Track LESEN?
+
+    Ein einziger Ort fuer den Lese-Zugriff. Vorher stand die Pruefung in FUENF
+    verschiedenen Schreibweisen an 24 GET-Endpunkten -- gezaehlt am 2026-08-01:
+
+        13x  track.created_by != current_user.id
+              -> streng eigentuemer-only. Ignoriert Sichtbarkeit UND
+                 Kollaborateure. Das war der gemeldete Fehler (Issue #673):
+                 ein oeffentlicher Track blieb fuer alle ausser dem Eigentuemer
+                 gesperrt.
+         7x  ... and visibility == "private" and trust_level not in (admin, moderator)
+         2x  visibility == "private" and created_by != ...
+         1x  ... and visibility == "private"
+         1x  not track or (... visibility ... trust_level ...)
+
+    Die letzten vier Formen liessen oeffentliche Tracks bereits durch -- 11 der
+    24 Endpunkte waren also nie kaputt. Das ist der Grund, warum der Fehler so
+    schwer zu fassen war: Ein Client bekam bei manchen Aufrufen Daten und bei
+    anderen 403, ohne erkennbare Regel.
+
+    KEINE der beiden vorhandenen Bauarten war fuer sich vollstaendig:
+
+      - `get_user_permissions(...).can_view` kennt Eigentuemer, aktive
+        Kollaborateure und oeffentliche Tracks -- aber KEINE Trust-Stufen.
+        Haette man alles darauf umgestellt, haetten Admins und Moderatoren
+        ihren Zugriff auf private Tracks VERLOREN.
+      - Die Sichtbarkeits-Variante kennt Trust-Stufen -- aber keine
+        Kollaborateure. Ein eingetragener Mitarbeiter an einem privaten Track
+        wurde davon abgewiesen.
+
+    Diese Funktion ist die Vereinigung beider: Eigentuemer ODER aktiver
+    Kollaborateur ODER oeffentlicher Track ODER Admin/Moderator.
+
+    NUR FUER LESEZUGRIFFE. Schreibpfade duerfen das hier nicht verwenden: Bei
+    einem oeffentlichen Track ist das Ergebnis fuer JEDEN wahr. Die 40
+    Schreib-Stellen tragen dieselbe `created_by`-Zeile im Wortlaut und bleiben
+    bewusst unangetastet -- wer sie mechanisch mitersetzt, macht den Track fuer
+    jeden authentifizierten Nutzer beschreibbar.
+    """
+    if track is None or user is None:
+        return False
+    if getattr(user, "trust_level", None) in MODERATION_TRUST_LEVELS:
+        return True
+    return get_user_permissions(track, user.id).can_view

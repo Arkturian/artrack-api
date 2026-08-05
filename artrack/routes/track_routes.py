@@ -10,6 +10,7 @@ from ..models import (
     Track, TrackCreate, TrackResponse, TrackStats, User
 )
 from ..auth import get_current_user
+from artrack.collaboration_models import can_read_track
 
 router = APIRouter()
 
@@ -116,7 +117,7 @@ async def get_track(
         raise HTTPException(status_code=404, detail="Track not found")
     
     # Check permissions (user can see their own tracks, or public tracks)
-    if track.created_by != current_user.id and track.visibility == "private":
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
     
     # Calculate stats

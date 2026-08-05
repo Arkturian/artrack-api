@@ -35,6 +35,11 @@ class Settings:
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
     ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
     API_KEY: str = os.getenv("API_KEY", "Inetpass1")
+    # Public Firebase project identifier used to verify iOS ID tokens. This is
+    # not a credential and can be overridden for another deployment.
+    FIREBASE_PROJECT_ID: str = os.getenv(
+        "ARTRACK_FIREBASE_PROJECT_ID", "sensepresenter"
+    )
     
     # AI Services (using existing endpoints on SAME FastAPI instance)
     AI_BASE_URL: str = os.getenv("AI_BASE_URL", "http://localhost:8001")

@@ -13,6 +13,7 @@ from ..models import Track, Waypoint
 from ..models import TrackSegment as TrackSegmentModel
 from ..models import TrackRoute as TrackRouteModel
 from pydantic import BaseModel
+from artrack.collaboration_models import can_read_track
 
 router = APIRouter()
 
@@ -107,7 +108,7 @@ async def list_segments(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
     segments = db.query(TrackSegmentModel).filter(TrackSegmentModel.track_id == track_id).order_by(TrackSegmentModel.started_at.asc()).all()
@@ -133,7 +134,7 @@ async def get_segment_geometry(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
+    if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
     seg = db.query(TrackSegmentModel).filter(TrackSegmentModel.id == segment_id, TrackSegmentModel.track_id == track_id).first()
     if not seg:
