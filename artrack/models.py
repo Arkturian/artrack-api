@@ -541,6 +541,7 @@ class WaypointDetailResponse(BaseModel):
     segment_id: Optional[int] = None
     route_id: Optional[int] = None
     priority: Optional[float] = None  # -1.0 to 1.0
+    archived: Optional[bool] = None
     media: List[MediaFileResponse] = []
     storage_object_ids: Optional[List[int]] = None
 

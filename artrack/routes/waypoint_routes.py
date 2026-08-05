@@ -316,6 +316,7 @@ async def list_waypoints_detail(
                 # filter routes exactly like the server does.
                 "fixedRoutes": md.get("fixedRoutes"),
                 "snap_primary_route_id": (md.get("snap") or {}).get("primary_route_id"),
+                "archived": bool(getattr(wp, "archived", False)),
             })
         return slim
 
@@ -380,6 +381,7 @@ async def list_waypoints_detail(
             metadata_json=_meta,
             segment_id=wp.segment_id,
             priority=getattr(wp, 'priority', None),
+            archived=bool(getattr(wp, 'archived', False)),
             media=[MediaFileResponse(
                 media_id=m["media_id"],
                 type=m["type"],
@@ -1238,6 +1240,7 @@ async def get_waypoint_detail(
         priority=getattr(waypoint, "priority", None),
         route_id=getattr(waypoint, "route_id", None),
         segment_id=getattr(waypoint, "segment_id", None),
+        archived=bool(getattr(waypoint, "archived", False)),
     )
 
 # --- Per-POI generic settings (metadata_json.settings) ----------------------
