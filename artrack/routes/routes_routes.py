@@ -489,7 +489,8 @@ async def get_route_overview(
     # Load all waypoints (we'll filter GPS track points later)
     # Note: Can't use waypoint_type != "gps_track" because NULL != 'gps_track' returns NULL in SQL
     all_waypoints = db.query(Waypoint).filter(
-        Waypoint.track_id == track_id
+        Waypoint.track_id == track_id,
+        Waypoint.archived.isnot(True),
     ).all()
 
     # Filter out GPS track points in Python
@@ -705,7 +706,7 @@ async def get_route_waypoint_ids(
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
 
-    all_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id).all()
+    all_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id, Waypoint.archived.isnot(True)).all()
     waypoint_ids = []
     segment_waypoint_ids = []
     for wp in all_waypoints:
@@ -722,6 +723,34 @@ async def get_route_waypoint_ids(
         "waypoint_ids": waypoint_ids,
         "segment_waypoint_ids": segment_waypoint_ids,
     }
+
+
+@router.get("/{track_id}/routes/{route_id}/polyline")
+async def get_route_polyline(
+    track_id: int,
+    route_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    The route's polyline as a plain coordinate list — the geometry every
+    consumer previously had to dig out of the ios-guide-export payload
+    (Tschepp-clone request, 2026-08-05). Served from the memoized membership
+    geometry (same source as snap/membership), so it is cheap to poll.
+
+    Returns {track_id, route_id, count, polyline: [[lat, lon], ...]}.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    _, polylines = _get_membership_geometry(db, track_id, track)
+    poly = polylines.get(route_id)
+    if not poly:
+        raise HTTPException(status_code=404, detail=f"Route {route_id} has no polyline (needs >=2 gps_track points)")
+    return {"track_id": track_id, "route_id": route_id, "count": len(poly),
+            "polyline": [[lat, lon] for lat, lon in poly]}
 
 
 @router.get("/{track_id}/routes/{route_id}/detail", response_model=RouteDetail)
@@ -766,7 +795,8 @@ async def get_route_detail(
     # Load all non-GPS waypoints to find segment markers
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type != "gps_track"
+        Waypoint.waypoint_type != "gps_track",
+        Waypoint.archived.isnot(True),
     ).all()
 
     # Filter segment markers (waypoints with metadata_json.segment)
@@ -1053,7 +1083,8 @@ async def get_track_routes_overview(
 
         # Get route overview (internally uses the same logic as /overview endpoint)
         all_waypoints = db.query(Waypoint).filter(
-            Waypoint.track_id == track_id
+            Waypoint.track_id == track_id,
+            Waypoint.archived.isnot(True),
         ).all()
 
         # Filter out GPS track points
@@ -1396,7 +1427,8 @@ async def get_all_pois_pretty(
     # Get all non-GPS, non-segment waypoints
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type != "gps_track"
+        Waypoint.waypoint_type != "gps_track",
+        Waypoint.archived.isnot(True),
     ).all()
 
     pois = []
@@ -1539,7 +1571,8 @@ async def get_pois_near(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type != "gps_track",
         Waypoint.waypoint_type != "narration_point",
-        Waypoint.waypoint_type != "gps_telemetry"
+        Waypoint.waypoint_type != "gps_telemetry",
+        Waypoint.archived.isnot(True),
     ).all()
 
     # 4. For each POI: calculate distance, snap to route, filter
@@ -2187,7 +2220,8 @@ async def get_all_segments_pretty(
     # Get all segment marker waypoints
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type != "gps_track"
+        Waypoint.waypoint_type != "gps_track",
+        Waypoint.archived.isnot(True),
     ).all()
 
     # Group segment markers by name and route
@@ -2423,7 +2457,8 @@ async def get_route_pretty(
     # Get all non-GPS waypoints
     all_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type != "gps_track"
+        Waypoint.waypoint_type != "gps_track",
+        Waypoint.archived.isnot(True),
     ).all()
 
     pretty_pois = []

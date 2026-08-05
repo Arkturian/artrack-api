@@ -165,7 +165,11 @@ class Waypoint(Base):
     segment_id = Column(Integer, ForeignKey("track_segments.id"), nullable=True, index=True)
     # Optional route association for polyline grouping without segments
     route_id = Column(Integer, ForeignKey("track_routes.id"), nullable=True, index=True)
-    
+    # Archive flag: archived waypoints stay in the DB (comparison, rollback,
+    # attached TTS cues) but are excluded from all consumer-facing list
+    # endpoints by default (generation concept, e.g. story-point re-narrations).
+    archived = Column(Boolean, default=False, index=True)
+
     # Relationships
     media_files = relationship("MediaFile", back_populates="waypoint")
     analysis_results = relationship("AnalysisResult", back_populates="waypoint")

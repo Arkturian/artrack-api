@@ -235,6 +235,7 @@ async def list_waypoints_detail(
     waypoint_type: str | None = Query(None, description="filter by waypoint_type; comma-separated for multiple, e.g. 'manual,screen_point'"),
     fields: str | None = Query(None, description="'slim' returns a lightweight projection (id, coords, type, title, category, color, thumbnail_url, segment_role) without media/assets/snap/HLS — for fast map first-paint"),
     exclude_segment_markers: bool = Query(False, description="drop segment start/end marker waypoints (metadata_json.segment.role) — they are structural, not balloon POIs"),
+    include_archived: bool = Query(False, description="also return archived waypoints (old narration generations etc.); default hides them"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = 200,
@@ -250,6 +251,10 @@ async def list_waypoints_detail(
             raise HTTPException(status_code=403, detail="Access denied")
 
     query = db.query(Waypoint).filter(Waypoint.track_id == track_id)
+    if not include_archived:
+        # Archived waypoints (old narration generations etc.) stay in the DB
+        # but are invisible to consumers unless explicitly requested.
+        query = query.filter(Waypoint.archived.isnot(True))
     if segment_id is not None:
         query = query.filter(Waypoint.segment_id == segment_id)
     if waypoint_type:
@@ -1002,6 +1007,7 @@ class WaypointUpdate(BaseModel):
     latitude: Optional[float] = None   # In-place move: change position, waypoint_id stays stable
     longitude: Optional[float] = None
     waypoint_type: Optional[str] = None  # Reclassify (manual|screen_point|story_point|narration_point; gps_track excluded)
+    archived: Optional[bool] = None    # Archive/unarchive: hidden from list endpoints by default, never deleted
 
 # --- Chunked Uploads (optional) ---
 
@@ -1413,6 +1419,9 @@ async def update_waypoint(
     if update.priority is not None:
         waypoint.priority = max(-1.0, min(1.0, update.priority))  # Clamp to valid range
 
+    if update.archived is not None:
+        waypoint.archived = update.archived
+
     waypoint.updated_at = datetime.utcnow()
     db.commit()
 
@@ -1529,6 +1538,44 @@ async def recluster_knowledge(
 class StorageAttachRequest(BaseModel):
     storageIds: List[int]
     mediaType: Optional[str] = None  # photo, audio, video (optional hint)
+
+class WaypointArchiveBatch(BaseModel):
+    model_config = {"extra": "forbid"}
+    waypoint_ids: List[int]
+    archived: bool
+
+
+@router.put("/tracks/{track_id}/waypoints/archive")
+async def archive_waypoints_batch(
+    track_id: int,
+    body: WaypointArchiveBatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bulk archive/unarchive waypoints of a track (generation switching:
+    hundreds of story points flip in one call). Archiving never deletes —
+    the rows, metadata and TTS cues stay; list endpoints just stop returning
+    them until unarchived. Track creator or admin only."""
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    updated = (
+        db.query(Waypoint)
+        .filter(Waypoint.track_id == track_id, Waypoint.id.in_(body.waypoint_ids))
+        .update({Waypoint.archived: body.archived}, synchronize_session=False)
+    )
+    db.commit()
+    requested = len(set(body.waypoint_ids))
+    return {
+        "track_id": track_id,
+        "archived": body.archived,
+        "updated": updated,
+        "skipped": requested - updated,
+    }
+
 
 @router.post("/waypoints/{waypoint_id}/attach-storage", response_model=dict)
 async def attach_storage_to_waypoint(
