@@ -316,6 +316,8 @@ async def list_waypoints_detail(
                 # filter routes exactly like the server does.
                 "fixedRoutes": md.get("fixedRoutes"),
                 "snap_primary_route_id": (md.get("snap") or {}).get("primary_route_id"),
+                "route_id": getattr(wp, "route_id", None),
+                "altitude": wp.altitude,
                 "archived": bool(getattr(wp, "archived", False)),
             })
         return slim
@@ -380,6 +382,11 @@ async def list_waypoints_detail(
             waypoint_type=wp.waypoint_type,
             metadata_json=_meta,
             segment_id=wp.segment_id,
+            # route_id was missing here while the single-GET returned it: every
+            # consumer saw null and concluded the gps_track had no route binding
+            # (Tschepp elevation-profile report, 2026-08-09) — the data was fine,
+            # the list serializer just dropped the column.
+            route_id=getattr(wp, 'route_id', None),
             priority=getattr(wp, 'priority', None),
             archived=bool(getattr(wp, 'archived', False)),
             media=[MediaFileResponse(
