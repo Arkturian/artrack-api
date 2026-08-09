@@ -199,6 +199,11 @@ ON_TRACK_THRESHOLD_M = 25.0
 _POLYLINE_CACHE: dict = {}
 _POLYLINE_CACHE_TTL = 300.0  # seconds
 
+# Plausibility cap for elevation deltas when summing ascent/descent: 100% = 45°.
+# Steeper single steps are recording artefacts (GPS altitude noise, gaps), not
+# terrain — even the steepest gorge stairs stay below this over a GPS interval.
+_MAX_SLOPE = 1.0
+
 
 def _get_track_polylines(db: Session, track_id: int) -> dict:
     """
@@ -831,11 +836,41 @@ async def get_route_profile(
             })
         curated.sort(key=lambda c: c["along_meters"])
 
+    # Canonical ascent/descent — ONE number for every consumer, so frontends
+    # don't each roll their own sum (Tschepp: raw 515 m vs his 374 m).
+    # Raw summation is not trustworthy here: 173 m of the raw 515 m sit in
+    # steps steeper than 60% (one is 48 m over 17 m = 282%), i.e. recording
+    # artefacts, not terrain. Steps are therefore capped at _MAX_SLOPE before
+    # summing; the uncapped value ships alongside for transparency.
+    gain = loss = raw_gain = raw_loss = 0.0
+    for i in range(1, len(elevation)):
+        a0, a1 = elevation[i - 1]["altitude"], elevation[i]["altitude"]
+        if a0 is None or a1 is None:
+            continue
+        dh = a1 - a0
+        dist = elevation[i]["along_meters"] - elevation[i - 1]["along_meters"]
+        if dh > 0:
+            raw_gain += dh
+        else:
+            raw_loss -= dh
+        if dist > 0 and abs(dh) / dist > _MAX_SLOPE:
+            dh = _MAX_SLOPE * dist * (1 if dh > 0 else -1)
+        if dh > 0:
+            gain += dh
+        else:
+            loss -= dh
+
     return {
         "track_id": track_id,
         "route_id": route_id,
         "name": route.name,
         "total_distance_meters": round(cum, 1),
+        "elevation_gain_meters": round(gain),
+        "elevation_loss_meters": round(loss),
+        "elevation_gain_raw_meters": round(raw_gain),
+        "elevation_loss_raw_meters": round(raw_loss),
+        "elevation_min_meters": min((p["altitude"] for p in elevation if p["altitude"] is not None), default=None),
+        "elevation_max_meters": max((p["altitude"] for p in elevation if p["altitude"] is not None), default=None),
         "elevation": elevation,
         "curated_pois": curated,
     }

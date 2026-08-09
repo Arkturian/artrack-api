@@ -162,8 +162,12 @@ async def create_waypoints(
         
         results.append(result)
     
-    # Update track waypoint count
-    track.total_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id).count()
+    # Update track waypoint count — archived waypoints don't count towards the
+    # visible stock (a counter that ignores archiving reads as truth to the next
+    # consumer; Tschepp put 4175 into a concept doc while 990 were visible).
+    track.total_waypoints = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id, Waypoint.archived.isnot(True)
+    ).count()
     track.updated_at = datetime.utcnow()
     db.commit()
     
