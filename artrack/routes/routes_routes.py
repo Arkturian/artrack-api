@@ -757,6 +757,90 @@ async def get_route_polyline(
             "polyline": [[lat, lon] for lat, lon in poly]}
 
 
+@router.get("/{track_id}/routes/{route_id}/profile")
+async def get_route_profile(
+    track_id: int,
+    route_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Canonical aggregated RouteProfile — one call for elevation graph + curated POIs
+    (XCodeCodex-Map contract, 2026-08-07).
+
+    {track_id, route_id, name, total_distance_meters,
+     elevation: [{along_meters, altitude}],           # polyline order, cumulative
+     curated_pois: [{waypoint_id, segment_id, title?, knowledge_id?,
+                     along_meters, latitude, longitude}]}
+
+    Kilometrage is SERVER semantics: along_meters is the cumulative haversine
+    distance along this route's gps_track polyline; POIs are projected onto that
+    same polyline, so client and server never disagree. Archived waypoints are
+    excluded. altitude may be null where the recording had no elevation.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+    route = db.query(TrackRouteModel).filter(
+        TrackRouteModel.id == route_id, TrackRouteModel.track_id == track_id
+    ).first()
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    gps = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id,
+        Waypoint.route_id == route_id,
+        Waypoint.waypoint_type == "gps_track",
+    ).order_by(Waypoint.recorded_at.asc()).all()
+
+    elevation = []
+    poly = []
+    cum = 0.0
+    for i, p in enumerate(gps):
+        if i > 0:
+            prev = gps[i - 1]
+            cum += _haversine(prev.latitude, prev.longitude, p.latitude, p.longitude)
+        poly.append((p.latitude, p.longitude))
+        elevation.append({"along_meters": round(cum, 1), "altitude": p.altitude})
+
+    # Curated POIs = non-gps, non-archived waypoints belonging to this route
+    curated = []
+    if len(poly) >= 2:
+        candidates = db.query(Waypoint).filter(
+            Waypoint.track_id == track_id,
+            Waypoint.waypoint_type != "gps_track",
+            Waypoint.archived.isnot(True),
+        ).all()
+        for wp in candidates:
+            if not _waypoint_belongs_to_route(wp, route_id, track_id, db, track):
+                continue
+            _, along, _, _ = _closest_point_on_polyline(poly, wp.latitude, wp.longitude)
+            md = wp.metadata_json or {}
+            kids = md.get("knowledge_ids") or ([md["knowledge_id"]] if md.get("knowledge_id") is not None else [])
+            curated.append({
+                "waypoint_id": wp.id,
+                "segment_id": wp.segment_id,
+                "title": md.get("title"),
+                "knowledge_id": kids[0] if kids else None,
+                "waypoint_type": wp.waypoint_type,
+                "along_meters": round(along, 1),
+                "latitude": wp.latitude,
+                "longitude": wp.longitude,
+            })
+        curated.sort(key=lambda c: c["along_meters"])
+
+    return {
+        "track_id": track_id,
+        "route_id": route_id,
+        "name": route.name,
+        "total_distance_meters": round(cum, 1),
+        "elevation": elevation,
+        "curated_pois": curated,
+    }
+
+
 @router.get("/{track_id}/routes/{route_id}/detail", response_model=RouteDetail)
 async def get_route_detail(
     track_id: int,
@@ -849,12 +933,27 @@ async def get_route_detail(
             start_wp = wps["start"]
             end_wp = wps["end"]
 
-            # Find waypoints between start and end
-            # Simple approach: use timestamps
-            segment_waypoints = [
-                wp for wp in all_route_waypoints
-                if start_wp.recorded_at <= wp.recorded_at <= end_wp.recorded_at
-            ]
+            # Select the GPS points BETWEEN the markers geometrically, by their
+            # along-distance on the route polyline. The previous timestamp
+            # window never matched in practice: segment markers are placed in
+            # the editor (Dec 2025) while the track was recorded earlier
+            # (Oct 2025) — every segment came back with 0 points / 0 m
+            # (XCodeCodex-Map RouteProfile report, 2026-08-07).
+            _poly = [(p.latitude, p.longitude) for p in all_route_waypoints]
+            if len(_poly) >= 2:
+                _, s_start, _, _ = _closest_point_on_polyline(_poly, start_wp.latitude, start_wp.longitude)
+                _, s_end, _, _ = _closest_point_on_polyline(_poly, end_wp.latitude, end_wp.longitude)
+                lo_m, hi_m = (s_start, s_end) if s_start <= s_end else (s_end, s_start)
+                _cum = 0.0
+                segment_waypoints = []
+                for _i, _p in enumerate(all_route_waypoints):
+                    if _i > 0:
+                        _prev = all_route_waypoints[_i - 1]
+                        _cum += _haversine(_prev.latitude, _prev.longitude, _p.latitude, _p.longitude)
+                    if lo_m <= _cum <= hi_m:
+                        segment_waypoints.append(_p)
+            else:
+                segment_waypoints = []
 
             waypoint_points = []
             segment_distance = 0.0
