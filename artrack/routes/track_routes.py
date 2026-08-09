@@ -31,7 +31,9 @@ async def create_track(
     if existing_track:
         # Calculate stats for existing track
         from ..models import Waypoint
-        total_waypoints = db.query(Waypoint).filter(Waypoint.track_id == existing_track.id).count()
+        total_waypoints = db.query(Waypoint).filter(
+            Waypoint.track_id == existing_track.id, Waypoint.archived.isnot(True)
+        ).count()
         processed_waypoints = db.query(Waypoint).filter(
             Waypoint.track_id == existing_track.id,
             Waypoint.processing_state == "published"
@@ -123,7 +125,12 @@ async def get_track(
     # Calculate stats
     from ..models import Waypoint, MediaFile, AnalysisResult
     
-    total_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id).count()
+    # Visible stock only — archived waypoints (old narration generations) must
+    # not inflate the number consumers read as "how many points does this track
+    # have" (Tschepp, 2026-08-09).
+    total_waypoints = db.query(Waypoint).filter(
+        Waypoint.track_id == track_id, Waypoint.archived.isnot(True)
+    ).count()
     
     processed_waypoints = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
