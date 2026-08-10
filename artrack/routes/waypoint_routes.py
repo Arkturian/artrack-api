@@ -412,6 +412,7 @@ async def list_narration_points(
     near: str | None = Query(None, description="geo filter 'lat,lon' — returns points within radius_m, sorted by distance"),
     radius_m: float | None = None,
     image_status: str | None = Query(None, description="filter by metadata_json.image_status: provisional|approved|rejected"),
+    include_archived: bool = Query(False, description="also return archived narration points; default hides them (they must not be narrated)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -441,10 +442,21 @@ async def list_narration_points(
         if not can_read_track(track, current_user):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    wps = db.query(Waypoint).filter(
+    _q = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type == "narration_point",
-    ).all()
+    )
+    # Archived points are out of stock and must not be narrated. This was the
+    # last consumer-facing read path without the exclusion — every other one has
+    # it. GuideDevBot's mirror calls this endpoint without parameters, so an
+    # archived source kept being mirrored into a playable story_point.
+    # Found by the sweep after the by-knowledge ghost-pin bug (2026-08-10);
+    # released with explicit go from Tschepp-clone (generator) + GuideDevBot
+    # (mirror). Sibling endpoint list_narration_generations deliberately keeps
+    # counting archived points — an inventory that hides stock is useless.
+    if not include_archived:
+        _q = _q.filter(Waypoint.archived == False)  # noqa: E712
+    wps = _q.all()
     # geo-near: parse "lat,lon" → distance filter (replaces interactions/nearby).
     near_lat = near_lon = None
     if near:
