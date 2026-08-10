@@ -2827,6 +2827,7 @@ async def get_waypoints_by_knowledge(
     knowledge_id: int,
     track_id: Optional[int] = None,
     primary_only: bool = False,
+    include_archived: bool = False,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
@@ -2835,12 +2836,21 @@ async def get_waypoints_by_knowledge(
     i.e. every place where this knowledge object (e.g. a species) is shown.
     Reverse of Knowledge's geo-lookup. Optionally constrain to one track.
 
+    Archived waypoints are hidden by default (`include_archived=true` to see
+    them), consistent with every other read path. Without this the index kept
+    handing out pins the map had already dropped — species markers reappeared
+    as ghosts after their waypoint was archived (Tschepp field report,
+    2026-08-10). A reverse index that outlives its source is worse than no
+    index: consumers cannot tell a stale hit from a live one.
+
     Returns: {knowledge_id, count, waypoints: [{id, track_id, lat, lng,
-              waypoint_type, title, assets, source_collection}]}
+              waypoint_type, title, assets, source_collection, archived}]}
     """
     q = db.query(Waypoint)
     if track_id is not None:
         q = q.filter(Waypoint.track_id == track_id)
+    if not include_archived:
+        q = q.filter(Waypoint.archived == False)  # noqa: E712
 
     # Match against the canonical knowledge_ids[] list AND the legacy scalar
     # knowledge_id (1:1 records). Done in Python for robustness across backends
@@ -2877,5 +2887,14 @@ async def get_waypoints_by_knowledge(
             "cluster_id": _kc.get("cluster_id"),
             "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
             "source_collection": meta.get("source_collection"),
+            # Explicit, so a consumer that opts into archived rows can still tell
+            # the two apart instead of inferring it from their absence.
+            "archived": bool(getattr(w, "archived", False)),
         })
-    return {"knowledge_id": knowledge_id, "count": len(out), "primary_only": primary_only, "waypoints": out}
+    return {
+        "knowledge_id": knowledge_id,
+        "count": len(out),
+        "primary_only": primary_only,
+        "include_archived": include_archived,
+        "waypoints": out,
+    }
