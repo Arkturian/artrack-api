@@ -26,6 +26,21 @@ PARTNER_ID = "artrack"
 # saves 401 silently → "Failed to persist".
 _AUTH_HEADERS = {"X-API-KEY": settings.API_KEY}
 
+# Read vs write timeouts, deliberately different.
+#
+# READ: a healthy resolve takes ~14 ms. The old blanket 15 s meant that when
+# content-api was unreachable, EVERY guide request hung for 15 s before failing
+# — in the field that is an audio guide "loading" for a quarter minute instead
+# of saying it cannot. 3 s is still ~200x the normal call and fails fast enough
+# to be honest with the user. (Tscheppaschlucht incident 2026-08-11: DNS moved
+# content-api.arkturian.com onto arkserver, which cannot reach its own public IP
+# via NAT hairpin → every read ran into the full timeout.)
+#
+# WRITE: unchanged at 15 s. Aborting a half-sent narration save is worse than
+# waiting for it — the read path is what users wait on, not the save.
+_READ_TIMEOUT = 3.0
+_WRITE_TIMEOUT = 15.0
+
 
 def _slug_for_track(track_id: int) -> str:
     """Deterministic slug for a track's narration post."""
@@ -40,7 +55,7 @@ def get_narration_post(track_id: int) -> Optional[Dict[str, Any]]:
     """
     slug = _slug_for_track(track_id)
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+        with httpx.Client(timeout=_READ_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             # Try to find by slug via posts list endpoint
             resp = client.get(
                 f"{CONTENT_API_BASE}/api/v1/posts/",
@@ -146,7 +161,7 @@ def save_narration_knowledge(
             merged_meta.update(post_data["metadata_json"])
             post_data["metadata_json"] = merged_meta
 
-        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+        with httpx.Client(timeout=_WRITE_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             if existing:
                 # Update existing post
                 post_id = existing["id"]
@@ -206,7 +221,7 @@ def resolve_narration(
     if include_content:
         params["include_content"] = "true"
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+        with httpx.Client(timeout=_READ_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             resp = client.get(f"{CONTENT_API_BASE}/api/v1/narrations", params=params)
             if resp.status_code == 404:
                 try:
@@ -235,7 +250,7 @@ def delete_narration_post(track_id: int) -> bool:
 
     post_id = existing["id"]
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+        with httpx.Client(timeout=_WRITE_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
             resp = client.delete(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/")
             if resp.status_code in (200, 204):
                 logger.info(f"Deleted narration post {post_id} for track {track_id}")
