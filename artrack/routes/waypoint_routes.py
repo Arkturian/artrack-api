@@ -87,10 +87,19 @@ async def create_waypoints(
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    
-    if track.created_by != current_user.id:
+
+    # Owner OR admin/moderator — the same rule the other write paths in this file
+    # already use (see the bulk/archive/settings endpoints below). This one was
+    # the odd strict-owner outlier, which locked out service callers entirely:
+    # X-API-KEY authenticates fine (auth.py maps it to a user), but a service
+    # user never owns the track, so every automated creation died on 403.
+    # Blocker for the swfme PoiOnboarding workflow (Tschepp/SWFME, 2026-08-16).
+    # Deliberately NOT widened to any authenticated user: creation stays gated on
+    # trust_level, so an ordinary key still cannot write into a foreign track.
+    if track.created_by != current_user.id and not _is_admin(current_user):
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
+
     results = []
     
     for waypoint_data in waypoint_batch.waypoints:
