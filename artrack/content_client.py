@@ -195,6 +195,39 @@ def save_narration_knowledge(
         return None
 
 
+def save_knowledge_to_post(post_id: int, knowledge: Dict[str, Any]) -> Optional[int]:
+    """Write a knowledge doc back into ONE specific narration post.
+
+    Companion to ``save_narration_knowledge``, which can only ever address the
+    canonical German post (it resolves by slug ``artrack-narration-{track_id}``).
+    The persona×language variants have their own posts, so writing a translated
+    cue set needs the post id — resolved beforehand via ``resolve_narration``.
+
+    Only ``content`` is sent. metadata_json is deliberately NOT touched here:
+    the variant posts carry ``persona_id``/``language`` that the content-api
+    resolver keys its exact-match on, and those belong to the doc author, not
+    to us. Writing cues must not be able to degrade a cell to fallback-only.
+
+    Returns post_id on success, None on failure.
+    """
+    try:
+        with httpx.Client(timeout=_WRITE_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+            resp = client.patch(
+                f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/",
+                json={"content": json.dumps(knowledge, ensure_ascii=False)},
+            )
+            if resp.status_code in (200, 204):
+                logger.info(f"Updated narration variant post {post_id}")
+                return post_id
+            logger.error(
+                f"Content API variant update failed: {resp.status_code} {resp.text[:300]}"
+            )
+            return None
+    except httpx.RequestError as e:
+        logger.error(f"Content API variant request failed: {e}")
+        return None
+
+
 def resolve_narration(
     track_id: int,
     persona: Optional[str] = None,

@@ -17,7 +17,7 @@ Endpoints (Track-Level):
 - DELETE /tracks/{track_id}/knowledge - Delete all knowledge
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from typing import Optional, Dict, Any, List
@@ -35,6 +35,7 @@ from ..auth import get_current_user, User
 from ..content_client import (
     get_narration_knowledge,
     save_narration_knowledge,
+    save_knowledge_to_post,
     delete_narration_post,
     resolve_narration,
 )
@@ -1711,11 +1712,63 @@ def _cue_auth_track(db: Session, track_id: int, current_user: User) -> Track:
     return track
 
 
-def _cue_load_slot(track_id: int, section: str, item_id: str, slot: str):
-    """Validate section/slot, load the narration doc, return (knowledge, slot_dict).
+def _cue_resolve_target(track_id: int, persona: Optional[str], lang: Optional[str]):
+    """Pick WHICH narration doc the cue write targets: canonical or a variant.
+
+    Without persona/lang → the canonical German post (legacy behaviour, resolved
+    by slug). With either set → the exact (persona × language) cell.
+
+    The hard rule here is **no writing through a fallback**. The resolver answers
+    a read with the next-best cell when the requested one is missing; a write
+    that followed that cascade would silently land translated cues in the GERMAN
+    doc (exactly what happened to Tschepp, who then had to delete the debris by
+    hand). So a write demands an exact hit: `fallback_applied` must be false and
+    a post_id must be present, otherwise 409 with the cell that WAS found.
+
+    Returns (knowledge_dict, target_post_id_or_None).
+    """
+    if not persona and not lang:
+        return get_narration_knowledge(track_id), None
+
+    resolved = resolve_narration(track_id, persona=persona, lang=lang, include_content=True)
+    if resolved is None:
+        raise HTTPException(status_code=502, detail="Narration resolver unreachable")
+    if resolved.get("error") == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No narration cell for persona={persona or '*'} lang={lang or '*'} on track {track_id}",
+        )
+    if resolved.get("fallback_applied"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Refusing to write through a fallback: requested persona={persona or '*'} "
+                f"lang={lang or '*'}, resolver offered persona={resolved.get('persona_id')} "
+                f"lang={resolved.get('language')} (post {resolved.get('post_id')}). "
+                "Create the target cell first — writing here would put the cues in the wrong language."
+            ),
+        )
+    post_id = resolved.get("post_id")
+    if not post_id:
+        raise HTTPException(status_code=409, detail="Resolver returned no post_id for the requested cell")
+    content = resolved.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=502, detail=f"Narration post {post_id} does not hold valid JSON")
+    if not isinstance(content, dict):
+        raise HTTPException(status_code=502, detail=f"Narration post {post_id} has no usable knowledge content")
+    return content, post_id
+
+
+def _cue_load_slot(track_id: int, section: str, item_id: str, slot: str,
+                   persona: Optional[str] = None, lang: Optional[str] = None):
+    """Validate section/slot, load the narration doc, return (knowledge, slot_dict, post_id).
 
     Creates an empty slot dict if the item exists but the slot has no text yet, so
     a cue can be attached to a not-yet-narrated slot. 404 if item_id is unknown.
+    persona/lang select a translated variant doc instead of the canonical one.
     """
     item_type = _CUE_SECTION_TO_TYPE.get(section)
     if not item_type:
@@ -1725,7 +1778,7 @@ def _cue_load_slot(track_id: int, section: str, item_id: str, slot: str):
             status_code=400,
             detail=f"Invalid slot '{slot}' for {section} (expected {_CUE_VALID_SLOTS[item_type]})",
         )
-    knowledge = get_narration_knowledge(track_id)
+    knowledge, target_post_id = _cue_resolve_target(track_id, persona, lang)
     if not knowledge:
         raise HTTPException(status_code=404, detail="No knowledge found for this track")
     items = knowledge.get(section, {})
@@ -1738,13 +1791,22 @@ def _cue_load_slot(track_id: int, section: str, item_id: str, slot: str):
         item[slot] = slot_data
     if not isinstance(slot_data.get("cues"), list):
         slot_data["cues"] = []
-    return knowledge, slot_data
+    return knowledge, slot_data, target_post_id
 
 
-def _cue_persist(track_id: int, track: Track, knowledge: Dict, slot_data: Dict, section: str, item_id: str, slot: str) -> Dict:
-    """Recompute index/total_duration, save the doc, return the standard response."""
+def _cue_persist(track_id: int, track: Track, knowledge: Dict, slot_data: Dict, section: str, item_id: str, slot: str,
+                 target_post_id: Optional[int] = None, persona: Optional[str] = None, lang: Optional[str] = None) -> Dict:
+    """Recompute index/total_duration, save the doc, return the standard response.
+
+    target_post_id set → write into that variant post (translated cell); None →
+    the canonical German post via slug. The response echoes persona/language so
+    a caller can never be in doubt about which cell it just wrote.
+    """
     slot_data["total_duration"] = _cue_reindex_and_total(slot_data["cues"])
-    post_id = save_narration_knowledge(track_id, track.name, knowledge)
+    if target_post_id:
+        post_id = save_knowledge_to_post(target_post_id, knowledge)
+    else:
+        post_id = save_narration_knowledge(track_id, track.name, knowledge)
     if not post_id:
         raise HTTPException(status_code=502, detail="Failed to persist cues to content-api")
     return {
@@ -1753,6 +1815,9 @@ def _cue_persist(track_id: int, track: Track, knowledge: Dict, slot_data: Dict, 
         "item_id": item_id,
         "slot": slot,
         "content_post_id": post_id,
+        "persona_id": persona,
+        "language": lang,
+        "variant": bool(target_post_id),
         "total_duration": slot_data["total_duration"],
         "cues": slot_data["cues"],
     }
@@ -1765,6 +1830,8 @@ def add_cue(
     item_id: str,
     slot: str,
     body: CueCreate,
+    persona: Optional[str] = Query(None, description="target a persona\u00d7language narration variant; omit for the canonical German doc"),
+    lang: Optional[str] = Query(None, description="language of the target cell, e.g. 'en'; requires the exact cell to exist (no fallback writes)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1774,14 +1841,14 @@ def add_cue(
     adds a duplicate cue. Use PUT .../cues/{index} to set a known position.
     """
     track = _cue_auth_track(db, track_id, current_user)
-    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    knowledge, slot_data, target_post_id = _cue_load_slot(track_id, section, item_id, slot, persona, lang)
     slot_data["cues"].append({
         "index": len(slot_data["cues"]),
         "text": body.text,
         "audio_storage_id": body.audio_storage_id,
         "duration_seconds": body.duration_seconds or 0,
     })
-    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot, target_post_id, persona, lang)
 
 
 @router.put("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/{index}")
@@ -1792,12 +1859,14 @@ def update_cue(
     slot: str,
     index: int,
     body: CueUpdate,
+    persona: Optional[str] = Query(None, description="target a persona\u00d7language narration variant; omit for the canonical German doc"),
+    lang: Optional[str] = Query(None, description="language of the target cell, e.g. 'en'; requires the exact cell to exist (no fallback writes)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Partial-update the cue at {index}. Idempotent. 404 if index out of range."""
     track = _cue_auth_track(db, track_id, current_user)
-    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    knowledge, slot_data, target_post_id = _cue_load_slot(track_id, section, item_id, slot, persona, lang)
     cues = slot_data["cues"]
     if index < 0 or index >= len(cues):
         raise HTTPException(status_code=404, detail=f"Cue index {index} out of range (0..{len(cues) - 1})")
@@ -1807,7 +1876,7 @@ def update_cue(
         cues[index]["audio_storage_id"] = body.audio_storage_id
     if body.duration_seconds is not None:
         cues[index]["duration_seconds"] = body.duration_seconds
-    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot, target_post_id, persona, lang)
 
 
 @router.delete("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/{index}")
@@ -1817,17 +1886,19 @@ def delete_cue(
     item_id: str,
     slot: str,
     index: int,
+    persona: Optional[str] = Query(None, description="target a persona\u00d7language narration variant; omit for the canonical German doc"),
+    lang: Optional[str] = Query(None, description="language of the target cell, e.g. 'en'; requires the exact cell to exist (no fallback writes)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Remove the cue at {index}; remaining cues are renumbered. 404 if out of range."""
     track = _cue_auth_track(db, track_id, current_user)
-    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    knowledge, slot_data, target_post_id = _cue_load_slot(track_id, section, item_id, slot, persona, lang)
     cues = slot_data["cues"]
     if index < 0 or index >= len(cues):
         raise HTTPException(status_code=404, detail=f"Cue index {index} out of range (0..{len(cues) - 1})")
     cues.pop(index)
-    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot, target_post_id, persona, lang)
 
 
 @router.post("/{track_id}/knowledge/{section}/{item_id}/{slot}/cues/reorder")
@@ -1837,12 +1908,14 @@ def reorder_cues(
     item_id: str,
     slot: str,
     body: CueReorder,
+    persona: Optional[str] = Query(None, description="target a persona\u00d7language narration variant; omit for the canonical German doc"),
+    lang: Optional[str] = Query(None, description="language of the target cell, e.g. 'en'; requires the exact cell to exist (no fallback writes)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Reorder cues. body.order must be a permutation of the current indices."""
     track = _cue_auth_track(db, track_id, current_user)
-    knowledge, slot_data = _cue_load_slot(track_id, section, item_id, slot)
+    knowledge, slot_data, target_post_id = _cue_load_slot(track_id, section, item_id, slot, persona, lang)
     cues = slot_data["cues"]
     if sorted(body.order) != list(range(len(cues))):
         raise HTTPException(
@@ -1850,7 +1923,7 @@ def reorder_cues(
             detail=f"order must be a permutation of 0..{len(cues) - 1}, got {body.order}",
         )
     slot_data["cues"] = [cues[i] for i in body.order]
-    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot)
+    return _cue_persist(track_id, track, knowledge, slot_data, section, item_id, slot, target_post_id, persona, lang)
 
 
 @router.delete("/{track_id}/knowledge")
