@@ -124,6 +124,12 @@ class AudioGenerateRequest(BaseModel):
     voice: str = "nova"
     add_music: bool = False
     language: str = "de"
+    # Zielzelle der Sprachmatrix. Ohne diese beiden schreibt der Endpunkt in das
+    # kanonische DEUTSCHE Dokument — und vertont dessen deutschen Text. Eine
+    # englische Ansage ohne persona/lang wäre also doppelt falsch: falscher Text,
+    # falsches Dokument, Guthaben weg. (Befund vor Tschepps 53er-Lauf, 2026-08-31.)
+    persona: Optional[str] = None
+    lang: Optional[str] = None
 
 
 class CueItem(BaseModel):
@@ -1462,8 +1468,8 @@ async def generate_knowledge_audio(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    if track.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Only track creator can generate audio")
+    if track.created_by != current_user.id and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Only the track creator or an admin/moderator can generate audio")
 
     # Validate combinations
     valid_combinations = {
@@ -1482,7 +1488,11 @@ async def generate_knowledge_audio(
         raise HTTPException(status_code=400, detail="item_id required")
 
     # Get text from content-api
-    content_knowledge = get_narration_knowledge(track_id)
+    # Zielzelle auflösen (kanonisch ODER persona×lang) — derselbe fail-closed
+    # Guard wie auf den Cue-Pfaden: kein Schreiben durch einen Fallback.
+    content_knowledge, _audio_post_id, _audio_version = _cue_resolve_target(
+        track_id, body.persona, body.lang
+    )
     if not content_knowledge:
         raise HTTPException(status_code=404, detail="No knowledge found for this track")
 
@@ -1643,8 +1653,30 @@ async def generate_knowledge_audio(
         if body.text_type in item_data:
             item_data[body.text_type]["cues"] = cue_data
             item_data[body.text_type]["total_duration"] = total_duration
-        save_narration_knowledge(track_id, track.name, content_knowledge)
-        logger.info(f"Saved audio cues to content-api for {body.item_type} {body.item_id}")
+        try:
+            if _audio_post_id:
+                save_knowledge_to_post(_audio_post_id, content_knowledge, expected_version=_audio_version)
+            else:
+                save_narration_knowledge(track_id, track.name, content_knowledge, expected_version=_audio_version)
+        except NarrationVersionConflict as e:
+            # Die Aufnahme EXISTIERT bereits in Storage — nur die Verknüpfung
+            # scheitert. Deshalb die storage_ids mitgeben, damit ein Wiederholer
+            # sie anhängen kann, statt neu zu bezahlen.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "version_conflict",
+                    "message": (f"Narration document changed while linking the audio "
+                                f"(read version {e.expected}, store is at {e.current}). "
+                                "The audio was generated and is stored — re-read and attach these cues."),
+                    "audio_storage_ids": [c.get("audio_storage_id") for c in cues_result],
+                    "cues": cue_data,
+                },
+            )
+        logger.info(
+            f"Saved audio cues for {body.item_type} {body.item_id} "
+            f"(post {_audio_post_id or 'canonical'}, lang={body.lang or 'de'})"
+        )
 
     # Count successful cues
     successful_cues = sum(1 for c in cues_result if c.get("audio_storage_id"))
