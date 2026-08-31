@@ -14,6 +14,25 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class NarrationVersionConflict(Exception):
+    """The narration post moved between our read and our write.
+
+    Raised instead of letting the write win. The cue endpoints turn this
+    into a 409 so the caller re-reads and retries — a silent overwrite
+    would drop the other writer's cue while returning 200, i.e. paid
+    audio lost without a trace (Tschepp/Knowledge issue #1584).
+    """
+
+    def __init__(self, post_id: int, expected: int, current: int):
+        self.post_id = post_id
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"narration post {post_id} moved: read version {expected}, "
+            f"store is at {current}"
+        )
+
 CONTENT_API_BASE = settings.CONTENT_API_BASE
 DOC_TYPE = "audio_guide"
 AUTHOR_ID = "artrack-system"
@@ -110,10 +129,38 @@ def get_narration_knowledge(track_id: int) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_post_content_and_version(post_id: int):
+    """Read one post's knowledge JSON together with its version.
+
+    Both in a single GET on purpose: a version fetched separately from the
+    content is already stale by the time it is used, which would defeat the
+    optimistic guard it exists for.
+
+    Returns (knowledge_dict, version) or (None, None).
+    """
+    try:
+        with httpx.Client(timeout=_READ_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+            resp = client.get(f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/")
+            if resp.status_code != 200:
+                logger.error(f"Content API post {post_id} read failed: {resp.status_code}")
+                return None, None
+            post = resp.json()
+            content = post.get("content")
+            if isinstance(content, str):
+                content = json.loads(content)
+            if not isinstance(content, dict):
+                return None, None
+            return content, post.get("version")
+    except (httpx.RequestError, json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Content API post {post_id} read failed: {e}")
+        return None, None
+
+
 def save_narration_knowledge(
     track_id: int,
     track_name: str,
-    knowledge: Dict[str, Any]
+    knowledge: Dict[str, Any],
+    expected_version: Optional[int] = None,
 ) -> Optional[int]:
     """
     Create or update the narration post for a track.
@@ -165,10 +212,19 @@ def save_narration_knowledge(
             if existing:
                 # Update existing post
                 post_id = existing["id"]
+                if expected_version is not None:
+                    post_data["expected_version"] = expected_version
                 resp = client.put(
                     f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/",
                     json=post_data
                 )
+                if resp.status_code == 409:
+                    try:
+                        det = (resp.json() or {}).get("detail") or {}
+                        current = det.get("current_version")
+                    except Exception:
+                        current = None
+                    raise NarrationVersionConflict(post_id, expected_version, current)
                 if resp.status_code == 200:
                     logger.info(f"Updated narration post {post_id} for track {track_id}")
                     return post_id
@@ -195,7 +251,8 @@ def save_narration_knowledge(
         return None
 
 
-def save_knowledge_to_post(post_id: int, knowledge: Dict[str, Any]) -> Optional[int]:
+def save_knowledge_to_post(post_id: int, knowledge: Dict[str, Any],
+                           expected_version: Optional[int] = None) -> Optional[int]:
     """Write a knowledge doc back into ONE specific narration post.
 
     Companion to ``save_narration_knowledge``, which can only ever address the
@@ -212,10 +269,22 @@ def save_knowledge_to_post(post_id: int, knowledge: Dict[str, Any]) -> Optional[
     """
     try:
         with httpx.Client(timeout=_WRITE_TIMEOUT, follow_redirects=True, headers=_AUTH_HEADERS) as client:
+            payload: Dict[str, Any] = {"content": json.dumps(knowledge, ensure_ascii=False)}
+            if expected_version is not None:
+                payload["expected_version"] = expected_version
             resp = client.patch(
                 f"{CONTENT_API_BASE}/api/v1/posts/{post_id}/",
-                json={"content": json.dumps(knowledge, ensure_ascii=False)},
+                json=payload,
             )
+            if resp.status_code == 409:
+                # content-api answers a stale write with version_conflict and
+                # hands back the current version — surface it, never retry blind.
+                try:
+                    det = (resp.json() or {}).get("detail") or {}
+                    current = det.get("current_version")
+                except Exception:
+                    current = None
+                raise NarrationVersionConflict(post_id, expected_version, current)
             if resp.status_code in (200, 204):
                 logger.info(f"Updated narration variant post {post_id}")
                 return post_id
