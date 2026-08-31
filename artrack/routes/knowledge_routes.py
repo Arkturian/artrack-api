@@ -1710,8 +1710,12 @@ def _cue_auth_track(db: Session, track_id: int, current_user: User) -> Track:
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    if track.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Only track creator can edit cues")
+    # Owner OR admin/moderator — same rule as the waypoint write paths. Cue
+    # writing was strict-owner, which locked out every service caller: an
+    # automated voicing run never owns the track. Ordinary keys stay out, the
+    # gate remains bound to trust_level (Tschepp, ElevenLabs run 2026-08-31).
+    if track.created_by != current_user.id and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Only the track creator or an admin/moderator can edit cues")
     return track
 
 
