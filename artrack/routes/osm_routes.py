@@ -17,6 +17,7 @@ Cache strategy:
 """
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -290,6 +291,41 @@ _WITHIN_TTL = 7 * 24 * 3600          # areas essentially never move
 _WITHIN_BUDGET = 3.5                 # hard cap for the REQUEST the caller waits on
 _WITHIN_FILL_BUDGET = 25.0           # background fill may take as long as Overpass needs
 _WITHIN_FILLING: set[str] = set()    # cells currently being fetched, so we ask once
+_WITHIN_REDIS_PREFIX = "artrack:osm:within:"
+
+
+async def _within_cache_get(key: str):
+    """Read a cell from the SHARED cache, falling back to this worker's memory.
+
+    A per-process dict is not good enough here: the service runs four gunicorn
+    workers, so a warm cell answered only about one request in four while the
+    other three re-reported "filling". Measured before this was added. Redis is
+    already configured for the event bus, so the shared cache costs nothing new.
+    """
+    try:
+        from ..event_bus import _get_client  # lazy: Redis must never break OSM
+        client = _get_client()
+        if client is not None:
+            raw = await client.get(_WITHIN_REDIS_PREFIX + key)
+            if raw:
+                return json.loads(raw)
+    except Exception as e:
+        logger.debug(f"osm/within shared cache read failed: {e}")
+    hit = _WITHIN_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _WITHIN_TTL:
+        return hit[1]
+    return None
+
+
+async def _within_cache_put(key: str, areas: list) -> None:
+    _WITHIN_CACHE[key] = (time.time(), areas)      # local copy stays as fallback
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is not None:
+            await client.setex(_WITHIN_REDIS_PREFIX + key, _WITHIN_TTL, json.dumps(areas))
+    except Exception as e:
+        logger.debug(f"osm/within shared cache write failed: {e}")
 _WITHIN_GRID = 3                     # decimals ≈ 110 m lat / ~70 m lon at 50°N
 
 # Tags that make an enclosing area worth telling a visitor about.
@@ -354,9 +390,9 @@ async def osm_within(
     """
     cell = _within_cell(lat, lng)
     key = f"{cell}|{int(include_boundaries)}"
-    hit = _WITHIN_CACHE.get(key)
-    if hit and (time.time() - hit[0]) < _WITHIN_TTL:
-        return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit[1]}
+    hit = await _within_cache_get(key)
+    if hit is not None:
+        return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit}
 
     # A cold cell is answered EMPTY and filled in the background.
     #
@@ -392,7 +428,7 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
             )
             if resp.status_code == 200:
                 areas = _within_parse(resp.json().get("elements", []), include_boundaries)
-                _WITHIN_CACHE[key] = (time.time(), areas)
+                await _within_cache_put(key, areas)
                 logger.info(f"osm/within filled {key}: {len(areas)} areas")
             else:
                 logger.warning(f"osm/within fill {key}: HTTP {resp.status_code}")
