@@ -402,12 +402,32 @@ async def osm_within(
     # very case the endpoint exists for. So the caller is never held up, and the
     # fill runs with a budget Overpass can actually meet; the guide polls again
     # a few seconds later and hits a warm cache.
-    if key not in _WITHIN_FILLING:
+    if key not in _WITHIN_FILLING and await _within_claim(key):
         _WITHIN_FILLING.add(key)
         asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
             "areas": [], "filling": True}
+
+
+async def _within_claim(key: str) -> bool:
+    """Claim the right to fetch one cell, across ALL workers.
+
+    The in-process guard is not enough: four gunicorn workers each fired their
+    own Overpass request for the same cell, and Overpass answered with 429 and
+    504. A short shared lock means one request per cell instead of four, which
+    is also simply polite towards a free public service. Without Redis we fall
+    back to the per-process guard — worse, but never blocking.
+    """
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is not None:
+            return bool(await client.set(_WITHIN_REDIS_PREFIX + "lock:" + key,
+                                         "1", nx=True, ex=60))
+    except Exception as e:
+        logger.debug(f"osm/within claim failed, falling back to local guard: {e}")
+    return True
 
 
 async def _within_fill(key: str, lat: float, lng: float, include_boundaries: bool) -> None:
