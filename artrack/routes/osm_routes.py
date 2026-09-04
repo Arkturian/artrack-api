@@ -16,12 +16,15 @@ Cache strategy:
 - Max cache size: 500 entries (LRU eviction)
 """
 
+import logging
 import math
 import time
 from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Query, HTTPException
+
+logger = logging.getLogger("artrack.osm")
 
 router = APIRouter()
 
@@ -156,7 +159,22 @@ def _parse_elements(lat: float, lng: float, elements: list) -> list[dict]:
         })
 
     result.sort(key=lambda x: x["distance_m"])
-    return result[:20]  # cap at 20
+    return result  # caller caps; see _apply_kinds
+
+
+def _apply_kinds(rows: list[dict], kinds: Optional[str], limit: int = 20) -> list[dict]:
+    """Optional category filter, applied BEFORE the 20-item cap.
+
+    Filtering after the cap would be useless: the whole point is that a monument
+    must not be pushed out by twenty nearer bicycle stands. With `kinds` the
+    caller decides what competes for the twenty slots.
+    """
+    if kinds:
+        wanted = [k.strip().lower() for k in kinds.split(",") if k.strip()]
+        if wanted:
+            rows = [r for r in rows
+                    if any(w in (r.get("category") or "").lower() for w in wanted)]
+    return rows[:limit]
 
 
 # ── Endpoint ──────────────────────────────────────────────────────
@@ -166,6 +184,7 @@ async def osm_nearby(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters (max 2000)"),
+    kinds: Optional[str] = Query(None, description="comma-separated category filter, e.g. 'monument,attraction,museum,artwork,park'; substring match on the classified category"),
 ):
     """
     Query nearby named features from OpenStreetMap via Overpass.
@@ -216,7 +235,7 @@ async def osm_nearby(
         raise HTTPException(status_code=502, detail=f"All Overpass mirrors failed. Last: {last_error}")
 
     # Parse + cache
-    features = _parse_elements(lat, lng, data.get("elements", []))
+    features = _apply_kinds(_parse_elements(lat, lng, data.get("elements", [])), kinds)
     result = {
         "features": features,
         "count": len(features),
@@ -251,3 +270,105 @@ async def osm_nearby_compact(
         for f in features
     )
     return {"text": text, "count": len(features), "cached": data.get("cached", False)}
+
+
+# ── /osm/within — "which areas am I standing IN?" ────────────────────
+#
+# The nearby endpoint answers "what is around me" and returns points. It cannot
+# answer "I am inside a large park": a park's centroid may be hundreds of metres
+# away, so it looks like a distant object — or drops out entirely. Overpass'
+# `is_in` answers the containment question directly.
+#
+# Nominatim is not a substitute: reverse-geocoding Alex' position in the Parc du
+# Cinquantenaire returns the Army Museum at zoom 18 and the street "Avenue de la
+# Renaissance" at zoom 17/16 — never the park. That street is exactly what the
+# guide currently announces while the visitor is cycling through the park.
+
+_WITHIN_CACHE: dict[str, tuple[float, list]] = {}
+_WITHIN_TTL = 7 * 24 * 3600          # areas essentially never move
+_WITHIN_BUDGET = 3.5                 # hard cap; the live guide must not wait
+_WITHIN_GRID = 3                     # decimals ≈ 110 m lat / ~70 m lon at 50°N
+
+# Tags that make an enclosing area worth telling a visitor about.
+_WITHIN_KINDS = ("leisure", "landuse", "historic", "tourism", "amenity")
+
+
+def _within_cell(lat: float, lng: float) -> str:
+    return f"{round(lat, _WITHIN_GRID)},{round(lng, _WITHIN_GRID)}"
+
+
+def _within_parse(elements: list, include_boundaries: bool) -> list[dict]:
+    """Keep meaningful enclosing areas, smallest first.
+
+    Smallest-first is computed from the bounding box Overpass returns with
+    `out tags bb` — not guessed from the tag. At the Cinquantenaire that puts
+    the park (~67 units) ahead of the city (~6.264) and the region (~35.829).
+    """
+    rows = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name:
+            continue
+        if "boundary" in tags and not include_boundaries:
+            continue
+        kind = next((f"{k}={tags[k]}" for k in _WITHIN_KINDS if k in tags), None)
+        if kind is None:
+            if tags.get("building"):
+                kind = "building"
+            elif include_boundaries and "boundary" in tags:
+                kind = f"boundary={tags['boundary']}"
+            else:
+                continue
+        b = el.get("bounds") or {}
+        try:
+            size = (b["maxlat"] - b["minlat"]) * (b["maxlon"] - b["minlon"])
+        except KeyError:
+            size = float("inf")     # unknown size sorts last, never first
+        rows.append((size, {
+            "name": name,
+            "kind": kind,
+            "osm_type": el.get("type"),
+            "osm_id": el.get("id"),
+        }))
+    rows.sort(key=lambda r: r[0])
+    return [r[1] for r in rows]
+
+
+@router.get("/within")
+async def osm_within(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    include_boundaries: bool = Query(False, description="also return administrative areas (country, city, postal code …)"),
+):
+    """Areas the point lies INSIDE, smallest first.
+
+    Administrative boundaries are dropped by default — without that filter the
+    honest answer to "where am I" includes "in Benelux", which is true and
+    useless. Results are cached per ~110 m grid cell for a week; a cold cell is
+    capped at 3.5 s and falls back to an EMPTY list rather than an error, so a
+    slow or unreachable Overpass can never hold up a walking guide.
+    """
+    cell = _within_cell(lat, lng)
+    key = f"{cell}|{int(include_boundaries)}"
+    hit = _WITHIN_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _WITHIN_TTL:
+        return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit[1]}
+
+    query = (f"[out:json][timeout:10];is_in({lat},{lng})->.a;"
+             f"way(pivot.a);out tags bb;relation(pivot.a);out tags bb;")
+    areas: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=_WITHIN_BUDGET) as client:
+            resp = await client.post(OVERPASS_URLS[0], data={"data": query})
+            if resp.status_code == 200:
+                areas = _within_parse(resp.json().get("elements", []), include_boundaries)
+    except Exception as e:
+        # Deliberately swallowed: an empty list means "I don't know", which the
+        # guide can handle. An error would make it announce nothing at all.
+        logger.warning(f"osm/within failed for {cell}: {e}")
+        return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
+                "areas": [], "degraded": True}
+
+    _WITHIN_CACHE[key] = (time.time(), areas)
+    return {"lat": lat, "lng": lng, "cell": cell, "cached": False, "areas": areas}
