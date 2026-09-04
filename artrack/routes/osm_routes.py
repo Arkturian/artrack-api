@@ -237,6 +237,16 @@ async def osm_nearby(
     if data is None:
         raise HTTPException(status_code=502, detail=f"All Overpass mirrors failed. Last: {last_error}")
 
+    # Overpass signals a server-side timeout with HTTP 200 and a `remark`, not
+    # with an error status: the body then carries few or no elements. Without
+    # this flag that arrives as "there is nothing here", which is the one answer
+    # a guide must not give confidently. (GuideDevBot measured 0 results after
+    # 24 s at radius 800; a second run returned 20 results in 8 s — same place.)
+    remark = data.get("remark")
+    degraded = bool(remark)
+    if degraded:
+        logger.warning(f"osm/nearby degraded at {lat},{lng} r={radius_m}: {remark}")
+
     # Parse + cache
     features = _apply_kinds(_parse_elements(lat, lng, data.get("elements", [])), kinds)
     result = {
@@ -244,10 +254,16 @@ async def osm_nearby(
         "count": len(features),
         "query": {"lat": lat, "lng": lng, "radius_m": radius_m},
     }
+    if degraded:
+        result["degraded"] = True
+        result["degraded_reason"] = str(remark)[:200]
 
-    _cache[key] = result
-    _cache_ts[key] = time.time()
-    _evict_oldest()
+    if not degraded:
+        # A truncated result must never be cached: it would freeze "nothing here"
+        # for an hour at a place that is actually full of sights.
+        _cache[key] = result
+        _cache_ts[key] = time.time()
+        _evict_oldest()
 
     return {**result, "cached": False}
 
