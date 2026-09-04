@@ -77,6 +77,18 @@ def _build_query(lat: float, lng: float, radius_m: int) -> str:
   node(around:{r},{lat},{lng})["historic"];
   node(around:{r},{lat},{lng})["leisure"];
   way(around:{r},{lat},{lng})["building"];
+  // Areas, not just points. A monument mapped as a way or relation — the Arc
+  // du Cinquantenaire is one — could never appear before, no matter how close
+  // it was: only `node` was asked for. That made "nearby sights" a promise the
+  // endpoint could not keep. (GuideDevBot2, Brussels, 2026-09-04.)
+  way(around:{r},{lat},{lng})["historic"];
+  way(around:{r},{lat},{lng})["tourism"];
+  way(around:{r},{lat},{lng})["leisure"];
+  way(around:{r},{lat},{lng})["amenity"];
+  relation(around:{r},{lat},{lng})["historic"];
+  relation(around:{r},{lat},{lng})["tourism"];
+  relation(around:{r},{lat},{lng})["leisure"];
+  relation(around:{r},{lat},{lng})["amenity"];
 );
 out center tags;"""
 
@@ -117,8 +129,10 @@ def _parse_elements(lat: float, lng: float, elements: list) -> list[dict]:
             continue
         seen.add(name)
 
-        # Get coordinates (centroid for ways)
-        if el["type"] == "way":
+        # Get coordinates (centroid for ways AND relations — `out center` sets
+        # `center` for both; treating only `way` here silently dropped every
+        # relation, e.g. the Royal Military Museum at the Cinquantenaire.)
+        if el["type"] in ("way", "relation"):
             center = el.get("center", {})
             f_lat = center.get("lat")
             f_lng = center.get("lon")
