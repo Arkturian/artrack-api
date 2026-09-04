@@ -62,7 +62,8 @@ async def create_track(
             stats=stats,
             created_at=existing_track.created_at,
             updated_at=existing_track.updated_at,
-            metadata_json=existing_track.metadata_json
+            metadata_json=existing_track.metadata_json,
+            auto_detect_eligible=bool(getattr(existing_track, "auto_detect_eligible", False)),
         )
     
     # Create new track
@@ -75,7 +76,7 @@ async def create_track(
         client_track_id=track_data.client_track_id,
         created_by=current_user.id,
         storage_object_ids=(track_data.storage_object_ids or []),
-        storage_collection=(track_data.storage_collection or {})
+        storage_collection=(track_data.storage_collection or {}),
     )
     
     db.add(db_track)
@@ -103,7 +104,8 @@ async def create_track(
         updated_at=db_track.updated_at,
         metadata_json=db_track.metadata_json,
         storage_object_ids=getattr(db_track, 'storage_object_ids', None),
-        storage_collection=getattr(db_track, 'storage_collection', None)
+        storage_collection=getattr(db_track, 'storage_collection', None),
+        auto_detect_eligible=bool(getattr(db_track, "auto_detect_eligible", False)),
     )
 
 @router.get("/{track_id}", response_model=TrackResponse)
@@ -164,7 +166,8 @@ async def get_track(
         updated_at=track.updated_at,
         metadata_json=track.metadata_json,  # Include guide config
         storage_object_ids=getattr(track, 'storage_object_ids', None),
-        storage_collection=getattr(track, 'storage_collection', None)
+        storage_collection=getattr(track, 'storage_collection', None),
+        auto_detect_eligible=bool(getattr(track, "auto_detect_eligible", False)),
     )
 
     return track_response
@@ -230,7 +233,8 @@ async def list_tracks(
             updated_at=track.updated_at,
             metadata_json=track.metadata_json,
             storage_object_ids=getattr(track, 'storage_object_ids', None),
-            storage_collection=getattr(track, 'storage_collection', None)
+            storage_collection=getattr(track, 'storage_collection', None),
+            auto_detect_eligible=bool(getattr(track, "auto_detect_eligible", False)),
         )
 
         track_responses.append(track_response)

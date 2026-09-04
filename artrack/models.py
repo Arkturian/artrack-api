@@ -439,6 +439,12 @@ class TrackResponse(BaseModel):
     metadata_json: Optional[Dict[str, Any]] = None  # Include guide config and other metadata
     storage_object_ids: Optional[List[int]] = None
     storage_collection: Optional[Dict[str, Any]] = None
+    # Readable because it is writable: the flag decides whether the track may
+    # auto-activate in the guide (GET /tracks/nearby filters on it). Settable via
+    # PATCH but absent from the read model, callers had to infer its state from
+    # whether /tracks/nearby returned the track — the same "write-only field"
+    # trap as the route_id serializer hole.
+    auto_detect_eligible: bool = False
 
     class Config:
         from_attributes = True
