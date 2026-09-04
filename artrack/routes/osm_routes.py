@@ -86,14 +86,15 @@ def _build_query(lat: float, lng: float, radius_m: int) -> str:
   // du Cinquantenaire is one — could never appear before, no matter how close
   // it was: only `node` was asked for. That made "nearby sights" a promise the
   // endpoint could not keep. (GuideDevBot2, Brussels, 2026-09-04.)
+  //
+  // Deliberately ONLY historic+tourism as areas. Adding leisure and amenity too
+  // made the query so heavy it timed out (502 after 34 s, measured): every park,
+  // parking lot and school ground came back as a polygon. Those are containment,
+  // not sights — /osm/within answers "which area am I in" properly instead.
   way(around:{r},{lat},{lng})["historic"];
   way(around:{r},{lat},{lng})["tourism"];
-  way(around:{r},{lat},{lng})["leisure"];
-  way(around:{r},{lat},{lng})["amenity"];
   relation(around:{r},{lat},{lng})["historic"];
   relation(around:{r},{lat},{lng})["tourism"];
-  relation(around:{r},{lat},{lng})["leisure"];
-  relation(around:{r},{lat},{lng})["amenity"];
 );
 out center tags;"""
 
