@@ -16,6 +16,7 @@ Cache strategy:
 - Max cache size: 500 entries (LRU eviction)
 """
 
+import asyncio
 import logging
 import math
 import time
@@ -286,7 +287,9 @@ async def osm_nearby_compact(
 
 _WITHIN_CACHE: dict[str, tuple[float, list]] = {}
 _WITHIN_TTL = 7 * 24 * 3600          # areas essentially never move
-_WITHIN_BUDGET = 3.5                 # hard cap; the live guide must not wait
+_WITHIN_BUDGET = 3.5                 # hard cap for the REQUEST the caller waits on
+_WITHIN_FILL_BUDGET = 25.0           # background fill may take as long as Overpass needs
+_WITHIN_FILLING: set[str] = set()    # cells currently being fetched, so we ask once
 _WITHIN_GRID = 3                     # decimals ≈ 110 m lat / ~70 m lon at 50°N
 
 # Tags that make an enclosing area worth telling a visitor about.
@@ -355,20 +358,45 @@ async def osm_within(
     if hit and (time.time() - hit[0]) < _WITHIN_TTL:
         return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit[1]}
 
-    query = (f"[out:json][timeout:10];is_in({lat},{lng})->.a;"
+    # A cold cell is answered EMPTY and filled in the background.
+    #
+    # Measured against Overpass, `is_in` takes 2.3-6.2 s — routinely more than
+    # the 3.5 s a walking guide can wait. Capping the request alone would mean
+    # the first visitor in a cell essentially never gets an answer, which is the
+    # very case the endpoint exists for. So the caller is never held up, and the
+    # fill runs with a budget Overpass can actually meet; the guide polls again
+    # a few seconds later and hits a warm cache.
+    if key not in _WITHIN_FILLING:
+        _WITHIN_FILLING.add(key)
+        asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
+
+    return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
+            "areas": [], "filling": True}
+
+
+async def _within_fill(key: str, lat: float, lng: float, include_boundaries: bool) -> None:
+    """Fetch one cell's enclosing areas and put them in the cache."""
+    query = (f"[out:json][timeout:20];is_in({lat},{lng})->.a;"
              f"way(pivot.a);out tags bb;relation(pivot.a);out tags bb;")
-    areas: list[dict] = []
     try:
-        async with httpx.AsyncClient(timeout=_WITHIN_BUDGET) as client:
-            resp = await client.post(OVERPASS_URLS[0], data={"data": query})
+        async with httpx.AsyncClient(timeout=_WITHIN_FILL_BUDGET) as client:
+            # User-Agent is NOT optional: overpass-api.de answers a request
+            # without one with 406 Not Acceptable — which arrives as a fast,
+            # silent empty result rather than an error, so it looks like "no
+            # areas here" instead of "you asked wrong". The /nearby path already
+            # sends one; leaving it off here cost a deploy cycle to find.
+            resp = await client.post(
+                OVERPASS_URLS[0],
+                data={"data": query},
+                headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
+            )
             if resp.status_code == 200:
                 areas = _within_parse(resp.json().get("elements", []), include_boundaries)
+                _WITHIN_CACHE[key] = (time.time(), areas)
+                logger.info(f"osm/within filled {key}: {len(areas)} areas")
+            else:
+                logger.warning(f"osm/within fill {key}: HTTP {resp.status_code}")
     except Exception as e:
-        # Deliberately swallowed: an empty list means "I don't know", which the
-        # guide can handle. An error would make it announce nothing at all.
-        logger.warning(f"osm/within failed for {cell}: {e}")
-        return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
-                "areas": [], "degraded": True}
-
-    _WITHIN_CACHE[key] = (time.time(), areas)
-    return {"lat": lat, "lng": lng, "cell": cell, "cached": False, "areas": areas}
+        logger.warning(f"osm/within fill {key} failed: {e}")
+    finally:
+        _WITHIN_FILLING.discard(key)
