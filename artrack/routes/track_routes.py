@@ -300,6 +300,69 @@ async def update_track(
     return {"message": "Track updated successfully"}
 
 
+class TrackPatch(BaseModel):
+    """Partial track update — only the fields actually sent are written.
+
+    Exists because PUT /tracks/{id} takes a full TrackCreate: a caller who wants
+    to flip one flag has to resend everything, and anything TrackCreate does not
+    model (metadata_json among it) is silently dropped from the request. A PATCH
+    that writes exactly what it was given avoids both traps.
+
+    metadata_json is deliberately NOT settable here: it carries the guide
+    persona, curated dimensions and drop_places on production tracks, and a
+    whole-object write is the wrong shape for that — it would let one caller
+    erase another's configuration in a single call. Dedicated endpoints
+    (dimensions, guide-config) own those sub-trees.
+    """
+    name: Optional[str] = None
+    description: Optional[str] = None
+    visibility: Optional[str] = None  # 'private' | 'public' | … (wie im Track-Modell)
+    track_type: Optional[str] = None
+    tags: Optional[List[str]] = None
+    auto_detect_eligible: Optional[bool] = None
+
+
+@router.patch("/{track_id}")
+async def patch_track(
+    track_id: int,
+    patch: TrackPatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Partially update a track. Only the fields present in the body are changed.
+
+    `auto_detect_eligible` decides whether the track may auto-activate in the
+    guide when a visitor is nearby (`GET /tracks/nearby` filters on it). It had
+    no write path at all before — curated tracks had to be flipped by hand.
+    """
+    track = db.query(Track).filter(Track.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if track.created_by != current_user.id and current_user.trust_level not in ("admin", "moderator"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    changed = {}
+    for field in ("name", "description", "visibility", "track_type", "tags", "auto_detect_eligible"):
+        value = getattr(patch, field, None)
+        if value is None:
+            continue
+        if getattr(track, field) != value:
+            setattr(track, field, value)
+            changed[field] = value
+
+    if changed:
+        track.updated_at = datetime.utcnow()
+        track.version += 1
+        db.commit()
+
+    return {
+        "track_id": track.id,
+        "changed": changed,
+        "version": track.version,
+        "auto_detect_eligible": track.auto_detect_eligible,
+    }
+
+
 # ── Track Dimensions (curated thematic axes for AI audio guides) ──
 #
 # Tracks can carry operator-curated thematic "dimensions" (e.g. history, flora,
