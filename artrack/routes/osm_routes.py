@@ -308,6 +308,9 @@ _WITHIN_TTL = 7 * 24 * 3600          # areas essentially never move
 _WITHIN_BUDGET = 3.5                 # hard cap for the REQUEST the caller waits on
 _WITHIN_FILL_BUDGET = 25.0           # background fill may take as long as Overpass needs
 _WITHIN_FILLING: set[str] = set()    # cells currently being fetched, so we ask once
+_WITHIN_FAILS: dict[str, int] = {}   # consecutive failed fills per cell
+_WITHIN_MAX_FAILS = 3                # after this, say "degraded" instead of "filling"
+_WITHIN_STATS = {"started": 0, "completed": 0, "failed": 0}
 _WITHIN_REDIS_PREFIX = "artrack:osm:within:"
 
 
@@ -419,12 +422,22 @@ async def osm_within(
     # very case the endpoint exists for. So the caller is never held up, and the
     # fill runs with a budget Overpass can actually meet; the guide polls again
     # a few seconds later and hits a warm cache.
+    # A cell whose fill keeps failing must stop claiming to be "filling". After
+    # 20 minutes that is simply not a true statement any more, and a consumer
+    # that treats it as "not yet known" waits forever. (GuideDevBot2, 2026-09-05.)
+    if _WITHIN_FAILS.get(key, 0) >= _WITHIN_MAX_FAILS:
+        return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
+                "areas": [], "degraded": True,
+                "degraded_reason": f"{_WITHIN_FAILS[key]} consecutive fill failures",
+                "stats": dict(_WITHIN_STATS)}
+
     if key not in _WITHIN_FILLING and await _within_claim(key):
         _WITHIN_FILLING.add(key)
+        _WITHIN_STATS["started"] += 1
         asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
-            "areas": [], "filling": True}
+            "areas": [], "filling": True, "stats": dict(_WITHIN_STATS)}
 
 
 async def _within_claim(key: str) -> bool:
@@ -451,6 +464,10 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
     """Fetch one cell's enclosing areas and put them in the cache."""
     query = (f"[out:json][timeout:20];is_in({lat},{lng})->.a;"
              f"way(pivot.a);out tags bb;relation(pivot.a);out tags bb;")
+    # ALL mirrors, not just the first. On 2026-09-05 overpass-api.de was
+    # unreachable from arkserver while the other two answered fine — /nearby
+    # survived because it iterates, /within died silently because it did not.
+    # Every fill failed for hours and the endpoint kept answering "filling".
     try:
         async with httpx.AsyncClient(timeout=_WITHIN_FILL_BUDGET) as client:
             # User-Agent is NOT optional: overpass-api.de answers a request
@@ -458,18 +475,31 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
             # silent empty result rather than an error, so it looks like "no
             # areas here" instead of "you asked wrong". The /nearby path already
             # sends one; leaving it off here cost a deploy cycle to find.
-            resp = await client.post(
-                OVERPASS_URLS[0],
-                data={"data": query},
-                headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
-            )
-            if resp.status_code == 200:
-                areas = _within_parse(resp.json().get("elements", []), include_boundaries)
-                await _within_cache_put(key, areas)
-                logger.info(f"osm/within filled {key}: {len(areas)} areas")
-            else:
-                logger.warning(f"osm/within fill {key}: HTTP {resp.status_code}")
+            last = None
+            for url in OVERPASS_URLS:
+                try:
+                    resp = await client.post(
+                        url,
+                        data={"data": query},
+                        headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
+                    )
+                    if resp.status_code == 200:
+                        areas = _within_parse(resp.json().get("elements", []), include_boundaries)
+                        await _within_cache_put(key, areas)
+                        _WITHIN_FAILS.pop(key, None)
+                        _WITHIN_STATS["completed"] += 1
+                        logger.info(f"osm/within filled {key}: {len(areas)} areas via {url}")
+                        return
+                    last = f"{url}: HTTP {resp.status_code}"
+                except Exception as e:
+                    last = f"{url}: {e}"
+            _WITHIN_FAILS[key] = _WITHIN_FAILS.get(key, 0) + 1
+            _WITHIN_STATS["failed"] += 1
+            logger.warning(f"osm/within fill {key} failed on all mirrors (attempt "
+                           f"{_WITHIN_FAILS[key]}). Last: {last}")
     except Exception as e:
+        _WITHIN_FAILS[key] = _WITHIN_FAILS.get(key, 0) + 1
+        _WITHIN_STATS["failed"] += 1
         logger.warning(f"osm/within fill {key} failed: {e}")
     finally:
         _WITHIN_FILLING.discard(key)
