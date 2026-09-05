@@ -187,6 +187,7 @@ async def osm_nearby(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters (max 2000)"),
+    budget_s: float = Query(12.0, ge=0.5, le=30.0, description="per-mirror time budget; the realtime guide waits synchronously, so it passes a short one"),
     kinds: Optional[str] = Query(None, description="comma-separated category filter, e.g. 'monument,attraction,museum,artwork,park'; substring match on the classified category"),
 ):
     """
@@ -219,7 +220,7 @@ async def osm_nearby(
     query = _build_query(lat, lng, radius_m)
     data = None
     last_error = ""
-    async with httpx.AsyncClient(timeout=12.0) as client:
+    async with httpx.AsyncClient(timeout=budget_s) as client:
         for url in OVERPASS_URLS:
             try:
                 resp = await client.post(
@@ -235,7 +236,14 @@ async def osm_nearby(
                 continue  # try next mirror
 
     if data is None:
-        raise HTTPException(status_code=502, detail=f"All Overpass mirrors failed. Last: {last_error}")
+        # NOT a 5xx. The endpoint did its job; the external service did not, and
+        # the caller can act on that — "I could not look" is usable, an error is
+        # not. A realtime guide that gets a 500 goes down its error path and says
+        # nothing at all, which is worse than narrating without surroundings.
+        logger.warning(f"osm/nearby: all mirrors failed at {lat},{lng}. Last: {last_error}")
+        return {"features": [], "count": 0, "cached": False, "degraded": True,
+                "degraded_reason": f"all Overpass mirrors failed: {str(last_error)[:160]}",
+                "query": {"lat": lat, "lng": lng, "radius_m": radius_m}}
 
     # Overpass signals a server-side timeout with HTTP 200 and a `remark`, not
     # with an error status: the body then carries few or no elements. Without
@@ -273,22 +281,42 @@ async def osm_nearby_compact(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters"),
+    budget_s: float = Query(2.0, ge=0.5, le=30.0, description="time budget per mirror; short by default because a realtime model waits synchronously on this call"),
+    kinds: Optional[str] = Query(None, description="comma-separated category filter, same as /nearby"),
 ):
     """
     Same as /nearby but returns a single-line string for IACP messages.
 
     Format: "Café Mozart (cafe, 15m) | Stadtpark (park, 45m) | ..."
-    """
-    data = await osm_nearby(lat=lat, lng=lng, radius_m=radius_m)
-    features = data["features"]
-    if not features:
-        return {"text": "", "count": 0}
 
-    text = " | ".join(
-        f"{f['name']} ({f['category']}, {f['distance_m']}m)"
-        for f in features
-    )
-    return {"text": text, "count": len(features), "cached": data.get("cached", False)}
+    Two deliberate differences from /nearby, both because a realtime guide waits
+    on this call while the visitor stands there:
+    * the default budget is 2 s, not 12 — a slow answer is worse than none;
+    * it NEVER raises. Any failure comes back as an empty text with
+      `degraded: true`, so the model narrates without surroundings instead of
+      falling into its error path. (GuideDevBot2: a 500 here cost 5 s per turn
+      and pushed time-to-first-audio from ~1.5 s to 6-7 s.)
+    """
+    try:
+        data = await osm_nearby(lat=lat, lng=lng, radius_m=radius_m,
+                                budget_s=budget_s, kinds=kinds)
+    except Exception as e:
+        logger.warning(f"osm/nearby/compact failed at {lat},{lng}: {e}")
+        return {"text": "", "count": 0, "degraded": True,
+                "degraded_reason": str(e)[:160]}
+
+    features = data.get("features") or []
+    out = {
+        "text": " | ".join(
+            f"{f['name']} ({f['category']}, {f['distance_m']}m)" for f in features
+        ),
+        "count": len(features),
+        "cached": data.get("cached", False),
+    }
+    if data.get("degraded"):
+        out["degraded"] = True
+        out["degraded_reason"] = data.get("degraded_reason")
+    return out
 
 
 # ── /osm/within — "which areas am I standing IN?" ────────────────────
