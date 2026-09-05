@@ -291,7 +291,7 @@ async def osm_nearby_compact(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters"),
-    budget_s: float = Query(2.0, ge=0.5, le=30.0, description="time budget per mirror; short by default because a realtime model waits synchronously on this call"),
+    budget_s: float = Query(6.0, ge=0.5, le=30.0, description="TOTAL time budget across all mirrors. 6 s covers the ~5 s a full answer really takes and still leaves the third mirror room; pass a smaller value per call if a given caller prefers speed over surroundings"),
     kinds: Optional[str] = Query(None, description="comma-separated category filter, same as /nearby"),
 ):
     """
@@ -301,7 +301,10 @@ async def osm_nearby_compact(
 
     Two deliberate differences from /nearby, both because a realtime guide waits
     on this call while the visitor stands there:
-    * the default budget is 2 s, not 12 — a slow answer is worse than none;
+    * the default budget is 6 s, not 12. Measured: a full answer at Innsbruck
+      takes ~5.2 s (two mirrors failing, the third answering), so a 2 s cap
+      returned nothing at all — fast, and useless. The cap belongs at the call
+      site of whoever really prefers speed over surroundings, not in the default;
     * it NEVER raises. Any failure comes back as an empty text with
       `degraded: true`, so the model narrates without surroundings instead of
       falling into its error path. (GuideDevBot2: a 500 here cost 5 s per turn
