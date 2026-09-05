@@ -224,19 +224,29 @@ async def osm_nearby(
     # is 6 s, which is exactly what a caller asking for "at most 2 s" does not
     # want — and it is where the 5 s per turn in the realtime guide came from:
     # two mirrors timing out before the third answered, not one slow request.
+    # Each mirror gets a SHARE of the remaining budget, not all of it.
+    #
+    # Giving the first mirror the whole budget looks harmless until a mirror
+    # stops refusing and starts hanging: it then absorbs every second and the
+    # healthy mirrors are never tried. That is why raising the budget did not
+    # help — 5 s, 8 s and 12 s all returned nothing after exactly that long,
+    # because the same dead first mirror ate all of it. (GuideDevBot's
+    # measurement, Brussels, 2026-09-05 — the observation that did not fit.)
     deadline = time.monotonic() + budget_s
     async with httpx.AsyncClient() as client:
-        for url in OVERPASS_URLS:
+        for idx, url in enumerate(OVERPASS_URLS):
             remaining = deadline - time.monotonic()
             if remaining <= 0.1:
                 last_error = f"budget of {budget_s}s exhausted before {url}"
                 break
+            left = len(OVERPASS_URLS) - idx
+            share = max(0.5, remaining / left)
             try:
                 resp = await client.post(
                     url,
                     data={"data": query},
                     headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
-                    timeout=remaining,
+                    timeout=share,
                 )
                 resp.raise_for_status()
                 data = resp.json()
