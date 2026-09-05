@@ -187,7 +187,7 @@ async def osm_nearby(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters (max 2000)"),
-    budget_s: float = Query(12.0, ge=0.5, le=30.0, description="per-mirror time budget; the realtime guide waits synchronously, so it passes a short one"),
+    budget_s: float = Query(12.0, ge=0.5, le=30.0, description="TOTAL time budget across all mirrors, not per mirror — the realtime guide waits synchronously"),
     kinds: Optional[str] = Query(None, description="comma-separated category filter, e.g. 'monument,attraction,museum,artwork,park'; substring match on the classified category"),
 ):
     """
@@ -220,20 +220,30 @@ async def osm_nearby(
     query = _build_query(lat, lng, radius_m)
     data = None
     last_error = ""
-    async with httpx.AsyncClient(timeout=budget_s) as client:
+    # The budget is for the WHOLE call, not per mirror. Three mirrors at 2 s each
+    # is 6 s, which is exactly what a caller asking for "at most 2 s" does not
+    # want — and it is where the 5 s per turn in the realtime guide came from:
+    # two mirrors timing out before the third answered, not one slow request.
+    deadline = time.monotonic() + budget_s
+    async with httpx.AsyncClient() as client:
         for url in OVERPASS_URLS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.1:
+                last_error = f"budget of {budget_s}s exhausted before {url}"
+                break
             try:
                 resp = await client.post(
                     url,
                     data={"data": query},
                     headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
+                    timeout=remaining,
                 )
                 resp.raise_for_status()
                 data = resp.json()
                 break  # success
-            except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
+            except Exception as e:
                 last_error = f"{url}: {e}"
-                continue  # try next mirror
+                continue  # try next mirror while the budget lasts
 
     if data is None:
         # NOT a 5xx. The endpoint did its job; the external service did not, and
