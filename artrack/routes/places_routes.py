@@ -20,7 +20,13 @@ from fastapi import APIRouter, Query, HTTPException
 
 router = APIRouter()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "AIzaSyDAZnfJ30Hrs0LmBpNrGdzBvs9DV3_82BY")
+# NO default. The key used to sit here as a literal fallback — in a PUBLIC
+# repository, i.e. published with every clone and readable in the git history.
+# A billing-enabled Places key in public source is somebody else's free quota
+# at Alex' expense. It now comes from the service environment only; if it is
+# missing the endpoint answers 503 instead of silently calling Google with a
+# key that should no longer exist. (Found 2026-09-06 while answering T38.)
+GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 
 # ── SQLite Cache ──────────────────────────────────────────────────
@@ -185,6 +191,12 @@ async def places_nearby(
     cached = _cache_get(key)
     if cached:
         return {**cached, "cached": True}
+
+    if not GOOGLE_API_KEY:
+        # Fail closed instead of calling Google without a key: a 503 names the
+        # cause, an empty result would look like "nothing here".
+        raise HTTPException(status_code=503,
+                            detail="Places lookup unavailable: GOOGLE_PLACES_API_KEY is not configured")
 
     # Query Google
     params: dict = {
