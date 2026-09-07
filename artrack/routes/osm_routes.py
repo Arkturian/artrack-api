@@ -362,7 +362,9 @@ _WITHIN_FILLING: set[str] = set()    # cells currently being fetched, so we ask 
 _WITHIN_FAILS: dict[str, int] = {}   # consecutive failed fills per cell
 _WITHIN_MAX_FAILS = 3                # after this, say "degraded" instead of "filling"
 _WITHIN_STATS = {"started": 0, "completed": 0, "failed": 0}
-_WITHIN_REDIS_PREFIX = "artrack:osm:within:"
+# v2: entries now carry extent_m/area_m2/bbox. Bumping the prefix retires the
+# old shape instead of serving it for another week from a warm cache.
+_WITHIN_REDIS_PREFIX = "artrack:osm:within:v2:"
 
 
 async def _within_cache_get(key: str):
@@ -431,16 +433,33 @@ def _within_parse(elements: list, include_boundaries: bool) -> list[dict]:
             else:
                 continue
         b = el.get("bounds") or {}
-        try:
-            size = (b["maxlat"] - b["minlat"]) * (b["maxlon"] - b["minlon"])
-        except KeyError:
-            size = float("inf")     # unknown size sorts last, never first
-        rows.append((size, {
+        entry = {
             "name": name,
             "kind": kind,
             "osm_type": el.get("type"),
             "osm_id": el.get("id"),
-        }))
+        }
+        try:
+            dlat = b["maxlat"] - b["minlat"]
+            dlon = b["maxlon"] - b["minlon"]
+            size = dlat * dlon
+            # Metric extent, so a consumer can tell "you are in this room" from
+            # "you are in this district". The Pentagone — Brussels' whole inner
+            # city, ~2 km across — came back as an anchor for a pedestrian, with
+            # the pin a kilometre away at the polygon's reference point. Degrees
+            # alone cannot express that; longitude degrees shrink with latitude,
+            # so the conversion needs the cosine. (GuideDevBot2, 2026-09-07.)
+            mid_lat = (b["maxlat"] + b["minlat"]) / 2.0
+            m_per_deg_lat = 111_320.0
+            m_per_deg_lon = 111_320.0 * math.cos(math.radians(mid_lat))
+            h = dlat * m_per_deg_lat
+            w = dlon * m_per_deg_lon
+            entry["extent_m"] = round(math.hypot(w, h))
+            entry["area_m2"] = round(w * h)
+            entry["bbox"] = {k: b[k] for k in ("minlat", "minlon", "maxlat", "maxlon")}
+        except (KeyError, TypeError):
+            size = float("inf")     # unknown size sorts last, never first
+        rows.append((size, entry))
     rows.sort(key=lambda r: r[0])
     return [r[1] for r in rows]
 
