@@ -479,7 +479,11 @@ async def osm_within(
     slow or unreachable Overpass can never hold up a walking guide.
     """
     cell = _within_cell(lat, lng)
-    key = f"{cell}|{int(include_boundaries)}"
+    # The shape version belongs in the KEY, not only in the Redis prefix: the
+    # in-process fallback cache is keyed by this string too, and versioning just
+    # the prefix let a warm worker keep serving the old shape (measured — the
+    # first call after adding extent_m still came back without it).
+    key = f"v2|{cell}|{int(include_boundaries)}"
     hit = await _within_cache_get(key)
     if hit is not None:
         return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit}
