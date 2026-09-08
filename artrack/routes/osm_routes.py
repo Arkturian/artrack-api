@@ -364,7 +364,7 @@ _WITHIN_MAX_FAILS = 3                # after this, say "degraded" instead of "fi
 _WITHIN_STATS = {"started": 0, "completed": 0, "failed": 0}
 # v2: entries now carry extent_m/area_m2/bbox. Bumping the prefix retires the
 # old shape instead of serving it for another week from a warm cache.
-_WITHIN_REDIS_PREFIX = "artrack:osm:within:v2:"
+_WITHIN_REDIS_PREFIX = "artrack:osm:within:v3:"
 
 
 async def _within_cache_get(key: str):
@@ -402,7 +402,11 @@ async def _within_cache_put(key: str, areas: list) -> None:
 _WITHIN_GRID = 3                     # decimals ≈ 110 m lat / ~70 m lon at 50°N
 
 # Tags that make an enclosing area worth telling a visitor about.
-_WITHIN_KINDS = ("leisure", "landuse", "historic", "tourism", "amenity")
+# `place` is in since 2026-09-07: GuideDevBot's anchor rule is live (extent_m
+# <= 900 m may anchor, larger becomes context), so a 2 km "Pentagone" can be
+# admitted without becoming the thing the guide talks to. Before that rule it
+# would have re-created exactly the problem it was built to solve.
+_WITHIN_KINDS = ("leisure", "landuse", "historic", "tourism", "amenity", "place")
 
 
 def _within_cell(lat: float, lng: float) -> str:
@@ -483,10 +487,11 @@ async def osm_within(
     # in-process fallback cache is keyed by this string too, and versioning just
     # the prefix let a warm worker keep serving the old shape (measured — the
     # first call after adding extent_m still came back without it).
-    key = f"v2|{cell}|{int(include_boundaries)}"
+    key = f"v3|{cell}|{int(include_boundaries)}"
     hit = await _within_cache_get(key)
     if hit is not None:
-        return {"lat": lat, "lng": lng, "cell": cell, "cached": True, "areas": hit}
+        return {"lat": lat, "lng": lng, "cell": cell, "cached": True,
+                "areas": hit, "stats": dict(_WITHIN_STATS)}
 
     # A cold cell is answered EMPTY and filled in the background.
     #
@@ -499,10 +504,11 @@ async def osm_within(
     # A cell whose fill keeps failing must stop claiming to be "filling". After
     # 20 minutes that is simply not a true statement any more, and a consumer
     # that treats it as "not yet known" waits forever. (GuideDevBot2, 2026-09-05.)
-    if _WITHIN_FAILS.get(key, 0) >= _WITHIN_MAX_FAILS:
+    fails = max(_WITHIN_FAILS.get(key, 0), await _within_fail_count(key))
+    if fails >= _WITHIN_MAX_FAILS:
         return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
                 "areas": [], "degraded": True,
-                "degraded_reason": f"{_WITHIN_FAILS[key]} consecutive fill failures",
+                "degraded_reason": f"{fails} consecutive fill failures",
                 "stats": dict(_WITHIN_STATS)}
 
     if key not in _WITHIN_FILLING and await _within_claim(key):
@@ -512,6 +518,37 @@ async def osm_within(
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
             "areas": [], "filling": True, "stats": dict(_WITHIN_STATS)}
+
+
+async def _within_fail_count(key: str) -> int:
+    """Failure count shared across workers.
+
+    A per-process counter meant one worker answered `degraded` while the other
+    three kept saying `filling` for the same dead cell — the caller saw whichever
+    worker it happened to hit. The honest answer must not depend on that.
+    """
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is not None:
+            raw = await client.get(_WITHIN_REDIS_PREFIX + "fails:" + key)
+            return int(raw) if raw else 0
+    except Exception:
+        pass
+    return 0
+
+
+async def _within_note_failure(key: str) -> None:
+    _WITHIN_FAILS[key] = _WITHIN_FAILS.get(key, 0) + 1
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is not None:
+            k = _WITHIN_REDIS_PREFIX + "fails:" + key
+            await client.incr(k)
+            await client.expire(k, 900)
+    except Exception:
+        pass
 
 
 async def _within_claim(key: str) -> bool:
@@ -527,8 +564,12 @@ async def _within_claim(key: str) -> bool:
         from ..event_bus import _get_client
         client = _get_client()
         if client is not None:
+            # 20 s, not 60: the lock only needs to outlive one fill attempt.
+            # At 60 s a failed fill left the cell answering "filling" for a full
+            # minute in every worker, which is what made parks look permanently
+            # unfilled. (GuideDevBot's measurement, 2026-09-07.)
             return bool(await client.set(_WITHIN_REDIS_PREFIX + "lock:" + key,
-                                         "1", nx=True, ex=60))
+                                         "1", nx=True, ex=20))
     except Exception as e:
         logger.debug(f"osm/within claim failed, falling back to local guard: {e}")
     return True
@@ -561,18 +602,25 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
                         areas = _within_parse(resp.json().get("elements", []), include_boundaries)
                         await _within_cache_put(key, areas)
                         _WITHIN_FAILS.pop(key, None)
+                        try:
+                            from ..event_bus import _get_client as _gc
+                            _c = _gc()
+                            if _c is not None:
+                                await _c.delete(_WITHIN_REDIS_PREFIX + "fails:" + key)
+                        except Exception:
+                            pass
                         _WITHIN_STATS["completed"] += 1
                         logger.info(f"osm/within filled {key}: {len(areas)} areas via {url}")
                         return
                     last = f"{url}: HTTP {resp.status_code}"
                 except Exception as e:
                     last = f"{url}: {e}"
-            _WITHIN_FAILS[key] = _WITHIN_FAILS.get(key, 0) + 1
+            await _within_note_failure(key)
             _WITHIN_STATS["failed"] += 1
             logger.warning(f"osm/within fill {key} failed on all mirrors (attempt "
                            f"{_WITHIN_FAILS[key]}). Last: {last}")
     except Exception as e:
-        _WITHIN_FAILS[key] = _WITHIN_FAILS.get(key, 0) + 1
+        await _within_note_failure(key)
         _WITHIN_STATS["failed"] += 1
         logger.warning(f"osm/within fill {key} failed: {e}")
     finally:
