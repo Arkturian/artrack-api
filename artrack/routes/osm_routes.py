@@ -684,7 +684,11 @@ async def osm_stats(
     and failing traffic are different numbers. (GuideDevBot2-clone, T17.)
     """
     now = time.gmtime()
-    base = time.mktime(now) - (now.tm_min * 60 + now.tm_sec)
+    # time.mktime() interprets its argument as LOCAL time. Feeding it a UTC
+    # struct shifted every bucket by the timezone offset, so the reader looked
+    # at hours the writer had never used and reported zeros while the counters
+    # were filling correctly. Derive the base from the epoch instead.
+    base = time.time() - (now.tm_min * 60 + now.tm_sec)
     buckets = [time.strftime("%Y%m%d%H", time.gmtime(base - i * 3600)) for i in range(hours)]
     mirrors = [_stat_host(u) for u in OVERPASS_URLS]
 
