@@ -261,6 +261,8 @@ async def osm_nearby(
         # not. A realtime guide that gets a 500 goes down its error path and says
         # nothing at all, which is worse than narrating without surroundings.
         logger.warning(f"osm/nearby: all mirrors failed at {lat},{lng}. Last: {last_error}")
+        await _stat_incr("nearby_total")
+        await _stat_incr("nearby_degraded")
         return {"features": [], "count": 0, "cached": False, "degraded": True,
                 "degraded_reason": f"all Overpass mirrors failed: {str(last_error)[:160]}",
                 "query": {"lat": lat, "lng": lng, "radius_m": radius_m}}
@@ -272,6 +274,9 @@ async def osm_nearby(
     # 24 s at radius 800; a second run returned 20 results in 8 s — same place.)
     remark = data.get("remark")
     degraded = bool(remark)
+    await _stat_incr("nearby_total")
+    if degraded:
+        await _stat_incr("nearby_degraded")
     if degraded:
         logger.warning(f"osm/nearby degraded at {lat},{lng} r={radius_m}: {remark}")
 
@@ -514,6 +519,7 @@ async def osm_within(
     if key not in _WITHIN_FILLING and await _within_claim(key):
         _WITHIN_FILLING.add(key)
         _WITHIN_STATS["started"] += 1
+        await _stat_incr("fill_started")
         asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
@@ -610,13 +616,17 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
                         except Exception:
                             pass
                         _WITHIN_STATS["completed"] += 1
+                        await _stat_incr("fill_ok", _stat_host(url))
                         logger.info(f"osm/within filled {key}: {len(areas)} areas via {url}")
                         return
                     last = f"{url}: HTTP {resp.status_code}"
+                    await _stat_incr("fill_fail", _stat_host(url))
                 except Exception as e:
                     last = f"{url}: {e}"
+                    await _stat_incr("fill_fail", _stat_host(url))
             await _within_note_failure(key)
             _WITHIN_STATS["failed"] += 1
+            await _stat_incr("fill_failed_all")
             logger.warning(f"osm/within fill {key} failed on all mirrors (attempt "
                            f"{_WITHIN_FAILS[key]}). Last: {last}")
     except Exception as e:
@@ -625,3 +635,102 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
         logger.warning(f"osm/within fill {key} failed: {e}")
     finally:
         _WITHIN_FILLING.discard(key)
+
+
+# ── Shared counters ───────────────────────────────────────────────────
+#
+# Per-process counters could not answer "is the source healthy right now":
+# four gunicorn workers each held their own, so the answer depended on which
+# one you hit. These live in Redis, bucketed per hour, so any worker can
+# report the same picture and a quiet day is distinguishable from a broken one.
+#
+# Key: artrack:osm:stat:{metric}[:{mirror}]:{YYYYMMDDHH}, TTL 48 h.
+
+_STAT_PREFIX = "artrack:osm:stat:"
+_STAT_TTL = 48 * 3600
+
+
+def _stat_host(url: str) -> str:
+    try:
+        return url.split("/")[2]
+    except Exception:
+        return "unknown"
+
+
+async def _stat_incr(metric: str, mirror: Optional[str] = None) -> None:
+    """Count one event. Never raises — a counter must not break a request."""
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is None:
+            return
+        bucket = time.strftime("%Y%m%d%H", time.gmtime())
+        key = f"{_STAT_PREFIX}{metric}" + (f":{mirror}" if mirror else "") + f":{bucket}"
+        await client.incr(key)
+        await client.expire(key, _STAT_TTL)
+    except Exception as e:
+        logger.debug(f"osm stat {metric} not counted: {e}")
+
+
+@router.get("/stats")
+async def osm_stats(
+    hours: int = Query(24, ge=1, le=48, description="window in whole hours, counted back from the current UTC hour"),
+):
+    """Read-only health counters. Makes NO upstream call.
+
+    Exists because neither the guide journal nor a generic /health can tell a
+    quiet day from a broken source: on a day without visitors the journal is
+    simply empty, which looks the same as a dead Overpass. Here, zero traffic
+    and failing traffic are different numbers. (GuideDevBot2-clone, T17.)
+    """
+    now = time.gmtime()
+    base = time.mktime(now) - (now.tm_min * 60 + now.tm_sec)
+    buckets = [time.strftime("%Y%m%d%H", time.gmtime(base - i * 3600)) for i in range(hours)]
+    mirrors = [_stat_host(u) for u in OVERPASS_URLS]
+
+    out: dict = {"window_hours": hours, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", now),
+                 "note": "no upstream call was made to produce these numbers"}
+    try:
+        from ..event_bus import _get_client
+        client = _get_client()
+        if client is None:
+            return {**out, "available": False,
+                    "reason": "shared counter store unreachable; per-worker numbers would be misleading"}
+
+        async def total(metric: str, mirror: Optional[str] = None) -> int:
+            keys = [f"{_STAT_PREFIX}{metric}" + (f":{mirror}" if mirror else "") + f":{b}" for b in buckets]
+            vals = await client.mget(keys)
+            return sum(int(v) for v in vals if v)
+
+        per_mirror = {}
+        for m in mirrors:
+            ok, fail = await total("fill_ok", m), await total("fill_fail", m)
+            per_mirror[m] = {"completed": ok, "failed": fail,
+                             "success_rate": round(ok / (ok + fail), 3) if (ok + fail) else None}
+
+        started = await total("fill_started")
+        completed = sum(v["completed"] for v in per_mirror.values())
+        failed_cells = await total("fill_failed_all")
+        nearby_total = await total("nearby_total")
+        nearby_degraded = await total("nearby_degraded")
+
+        out.update({
+            "available": True,
+            "within": {"started": started, "completed": completed,
+                       "failed_all_mirrors": failed_cells,
+                       "open": max(0, started - completed - failed_cells)},
+            "nearby": {"requests": nearby_total, "degraded": nearby_degraded,
+                       "degraded_share": round(nearby_degraded / nearby_total, 3) if nearby_total else None},
+            "mirrors": per_mirror,
+        })
+        # An empty window is NOT a health statement — say so instead of implying "fine".
+        if started == 0 and nearby_total == 0:
+            out["verdict"] = "no traffic in this window — says nothing about source health"
+        elif failed_cells and not completed:
+            out["verdict"] = "every fill failed — source unhealthy"
+        else:
+            out["verdict"] = "traffic present, see rates"
+        return out
+    except Exception as e:
+        logger.warning(f"osm/stats failed: {e}")
+        return {**out, "available": False, "reason": str(e)[:160]}
