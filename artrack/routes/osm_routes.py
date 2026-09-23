@@ -478,6 +478,7 @@ async def osm_within(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
     include_boundaries: bool = Query(False, description="also return administrative areas (country, city, postal code …)"),
+    wait_s: float = Query(2.5, ge=0.0, le=5.0, description="on a cold cell, wait up to this long for the fill before answering 'filling'; 0 = never wait"),
 ):
     """Areas the point lies INSIDE, smallest first.
 
@@ -521,6 +522,19 @@ async def osm_within(
         _WITHIN_STATS["started"] += 1
         await _stat_incr("fill_started")
         asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
+
+    # Short synchronous wait. The first call in a cold cell is exactly the moment
+    # a visitor walks INTO a building — answering "filling" there made the guide
+    # say "in front of the cathedral" while Alex stood inside it (Palma,
+    # 2026-09-17). Polling the shared cache (not our own task) also covers the
+    # case where another worker holds the fill.
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        hit = await _within_cache_get(key)
+        if hit is not None:
+            return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
+                    "waited": True, "areas": hit, "stats": dict(_WITHIN_STATS)}
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
             "areas": [], "filling": True, "stats": dict(_WITHIN_STATS)}
