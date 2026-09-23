@@ -478,7 +478,7 @@ async def osm_within(
     lat: float = Query(..., ge=-90, le=90),
     lng: float = Query(..., ge=-180, le=180),
     include_boundaries: bool = Query(False, description="also return administrative areas (country, city, postal code …)"),
-    wait_s: float = Query(2.5, ge=0.0, le=5.0, description="on a cold cell, wait up to this long for the fill before answering 'filling'; 0 = never wait"),
+    wait_s: float = Query(2.5, ge=0.0, le=8.0, description="on a cold cell, wait up to this long for the fill before answering 'filling'; 0 = never wait"),
 ):
     """Areas the point lies INSIDE, smallest first.
 
