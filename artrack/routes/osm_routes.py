@@ -395,6 +395,11 @@ async def osm_nearby(
     fails = await _nearby_fail_count(key)
     if fails >= 3:
         await _stat_incr("nearby_degraded")
+        if key not in _NEARBY_FILLING and await _probe_claim(_NEARBY_PREFIX, key) \
+                and await _nearby_claim(key):
+            _NEARBY_FILLING.add(key)
+            await _stat_incr("nearby_fill_probe")
+            asyncio.create_task(_nearby_fill(key, clat, clng, bucket))
         return {"features": [], "count": 0, "cached": False, "degraded": True,
                 "degraded_reason": f"{fails} consecutive fill failures (Overpass unavailable)",
                 "query": q}
@@ -637,6 +642,11 @@ async def osm_within(
     # that treats it as "not yet known" waits forever. (GuideDevBot2, 2026-09-05.)
     fails = max(_WITHIN_FAILS.get(key, 0), await _within_fail_count(key))
     if fails >= _WITHIN_MAX_FAILS:
+        if key not in _WITHIN_FILLING and await _probe_claim(_WITHIN_REDIS_PREFIX, key) \
+                and await _within_claim(key):
+            _WITHIN_FILLING.add(key)
+            await _stat_incr("fill_probe")
+            asyncio.create_task(_within_fill(key, lat, lng, include_boundaries))
         return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
                 "areas": [], "degraded": True,
                 "degraded_reason": f"{fails} consecutive fill failures",
@@ -663,6 +673,24 @@ async def osm_within(
 
     return {"lat": lat, "lng": lng, "cell": cell, "cached": False,
             "areas": [], "filling": True, "stats": dict(_WITHIN_STATS)}
+
+
+async def _probe_claim(prefix: str, key: str, every_s: int = 120) -> bool:
+    """At most one recovery attempt per `every_s` for a cell reported degraded.
+
+    `degraded` used to be terminal for the life of the failure counter (15 min):
+    no fill was started any more, so a cell stayed dark even after Overpass had
+    recovered. Now the degraded answer still goes out immediately, but a
+    throttled background fill keeps trying — the cell heals by itself.
+    """
+    try:
+        from ..event_bus import _get_client
+        c = _get_client()
+        if c is not None:
+            return bool(await c.set(prefix + "probe:" + key, "1", nx=True, ex=every_s))
+    except Exception:
+        pass
+    return False
 
 
 async def _within_fail_count(key: str) -> int:
@@ -709,12 +737,15 @@ async def _within_claim(key: str) -> bool:
         from ..event_bus import _get_client
         client = _get_client()
         if client is not None:
-            # 20 s, not 60: the lock only needs to outlive one fill attempt.
+            # 30 s: must outlive ONE fill attempt (budget 25 s). At 20 s a second
+            # worker could claim while the first still ran — two parallel fills
+            # of the same cell, seen 2026-09-25 21:39:15, doubling Overpass load.
+            # Never 60 s: a failed fill must not block the cell for a minute.
             # At 60 s a failed fill left the cell answering "filling" for a full
             # minute in every worker, which is what made parks look permanently
             # unfilled. (GuideDevBot's measurement, 2026-09-07.)
             return bool(await client.set(_WITHIN_REDIS_PREFIX + "lock:" + key,
-                                         "1", nx=True, ex=20))
+                                         "1", nx=True, ex=30))
     except Exception as e:
         logger.debug(f"osm/within claim failed, falling back to local guard: {e}")
     return True
