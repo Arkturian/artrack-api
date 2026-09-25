@@ -369,7 +369,7 @@ _WITHIN_MAX_FAILS = 3                # after this, say "degraded" instead of "fi
 _WITHIN_STATS = {"started": 0, "completed": 0, "failed": 0}
 # v2: entries now carry extent_m/area_m2/bbox. Bumping the prefix retires the
 # old shape instead of serving it for another week from a warm cache.
-_WITHIN_REDIS_PREFIX = "artrack:osm:within:v3:"
+_WITHIN_REDIS_PREFIX = "artrack:osm:within:v4:"
 
 
 async def _within_cache_get(key: str):
@@ -448,6 +448,13 @@ def _within_parse(elements: list, include_boundaries: bool) -> list[dict]:
             "osm_type": el.get("type"),
             "osm_id": el.get("id"),
         }
+        # Separate field on purpose: `kind` keeps its key order for every other
+        # consumer, and a park polygon that happens to carry a building tag must
+        # not turn into "a building" there. Consumers that care (cathedral vs
+        # zoo, GuideDevBot 2026-09-25) read this first and fall back to `kind`.
+        bval = tags.get("building")
+        if bval and bval != "yes":
+            entry["building"] = bval
         try:
             dlat = b["maxlat"] - b["minlat"]
             dlon = b["maxlon"] - b["minlon"]
@@ -493,7 +500,7 @@ async def osm_within(
     # in-process fallback cache is keyed by this string too, and versioning just
     # the prefix let a warm worker keep serving the old shape (measured — the
     # first call after adding extent_m still came back without it).
-    key = f"v3|{cell}|{int(include_boundaries)}"
+    key = f"v4|{cell}|{int(include_boundaries)}"
     hit = await _within_cache_get(key)
     if hit is not None:
         return {"lat": lat, "lng": lng, "cell": cell, "cached": True,
