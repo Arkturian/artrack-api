@@ -67,14 +67,14 @@ OVERPASS_URLS = [
 ]
 
 
-def _build_query(lat: float, lng: float, radius_m: int) -> str:
+def _build_query(lat: float, lng: float, radius_m: int, server_timeout: int = 8) -> str:
     """Overpass QL query for named features in radius."""
     r = radius_m
     # NO [name] filter in the query — it's paradoxically slower on Overpass
     # because it forces a per-element tag scan. We filter for name in Python
     # (_parse_elements checks for name). Without [name], Overpass uses fast
     # spatial indices only → 1-2s instead of 5-8s.
-    return f"""[out:json][timeout:8];
+    return f"""[out:json][timeout:{server_timeout}];
 (
   node(around:{r},{lat},{lng})["amenity"];
   node(around:{r},{lat},{lng})["shop"];
@@ -182,123 +182,239 @@ def _apply_kinds(rows: list[dict], kinds: Optional[str], limit: int = 20) -> lis
 
 # ── Endpoint ──────────────────────────────────────────────────────
 
+# ── /osm/nearby: shared cache + background fill (2026-09-25) ─────────
+#
+# Under Overpass load nearby failed for 20 of 23 requests in 24 h: every call
+# went straight to Overpass with ~4 s per mirror, the query is heavy in dense
+# city centres, and there was no warm path — only a per-worker 1 h cache, and
+# degraded answers were (rightly) never cached. Now nearby uses the same model
+# as /osm/within: raw elements per cell in Redis for a week, filled in the
+# background with a budget Overpass can meet, retried on its own, and a short
+# synchronous wait for the caller. Under load only the FIRST request per cell
+# goes without surroundings, not every one.
+#
+# The cache stores RAW elements around the cell centre, not the parsed answer.
+# The old cache stored features already filtered by `kinds` and measured from
+# the first caller's position, under a key that ignored `kinds` — a second
+# caller with another filter got the first caller's subset.
+
+_NEARBY_PREFIX = "artrack:osm:nearby:v1:"
+_NEARBY_TTL = 7 * 24 * 3600
+_NEARBY_FILL_BUDGET = 30.0
+_NEARBY_MARGIN_M = 100          # fetched beyond the bucket radius so cell-mates are covered
+_NEARBY_FILLING: set[str] = set()
+_NEARBY_FAILS: dict[str, int] = {}
+_NEARBY_RETRY_DELAYS = (20.0, 60.0)
+_NEARBY_KEEP_TAGS = ("name", "amenity", "shop", "tourism", "historic", "leisure",
+                     "natural", "landuse", "building")
+
+
+def _nearby_cell(lat: float, lng: float, radius_m: int):
+    bucket = min(_RADIUS_BUCKETS, key=lambda b: abs(b - radius_m))
+    clat, clng = round(lat, 3), round(lng, 3)
+    return f"{clat},{clng}|{bucket}", clat, clng, bucket
+
+
+async def _nearby_get(key: str):
+    try:
+        from ..event_bus import _get_client
+        c = _get_client()
+        if c is not None:
+            raw = await c.get(_NEARBY_PREFIX + key)
+            if raw:
+                return json.loads(raw)
+    except Exception as e:
+        logger.debug(f"osm/nearby cache read failed: {e}")
+    hit = _cache.get("nb|" + key)
+    if hit and (time.time() - _cache_ts.get("nb|" + key, 0)) < _NEARBY_TTL:
+        return hit
+    return None
+
+
+async def _nearby_put(key: str, elements: list) -> None:
+    _cache["nb|" + key] = elements
+    _cache_ts["nb|" + key] = time.time()
+    _evict_oldest()
+    try:
+        from ..event_bus import _get_client
+        c = _get_client()
+        if c is not None:
+            await c.setex(_NEARBY_PREFIX + key, _NEARBY_TTL, json.dumps(elements))
+    except Exception as e:
+        logger.debug(f"osm/nearby cache write failed: {e}")
+
+
+async def _nearby_fail_count(key: str) -> int:
+    try:
+        from ..event_bus import _get_client
+        c = _get_client()
+        if c is not None:
+            raw = await c.get(_NEARBY_PREFIX + "fails:" + key)
+            return max(int(raw) if raw else 0, _NEARBY_FAILS.get(key, 0))
+    except Exception:
+        pass
+    return _NEARBY_FAILS.get(key, 0)
+
+
+async def _nearby_claim(key: str) -> bool:
+    try:
+        from ..event_bus import _get_client
+        c = _get_client()
+        if c is not None:
+            return bool(await c.set(_NEARBY_PREFIX + "lock:" + key, "1", nx=True, ex=40))
+    except Exception:
+        pass
+    return True
+
+
+def _nearby_compact(elements: list) -> list:
+    out = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        if not tags.get("name"):
+            continue
+        c = el.get("center") or {}
+        la = el.get("lat", c.get("lat"))
+        lo = el.get("lon", c.get("lon"))
+        if la is None or lo is None:
+            continue
+        out.append({"type": el.get("type"), "id": el.get("id"),
+                    "lat": la, "lon": lo,
+                    "tags": {k: tags[k] for k in _NEARBY_KEEP_TAGS if k in tags}})
+    return out
+
+
+async def _nearby_fill(key: str, clat: float, clng: float, bucket: int) -> None:
+    query = _build_query(clat, clng, bucket + _NEARBY_MARGIN_M, server_timeout=25)
+    deadline = time.monotonic() + _NEARBY_FILL_BUDGET
+    last = None
+    try:
+        async with httpx.AsyncClient() as client:
+            for idx, url in enumerate(OVERPASS_URLS):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.5:
+                    break
+                share = max(2.0, remaining / (len(OVERPASS_URLS) - idx))
+                try:
+                    resp = await client.post(url, data={"data": query},
+                                             headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
+                                             timeout=share)
+                    if resp.status_code != 200:
+                        last = f"{url}: HTTP {resp.status_code}"
+                        await _stat_incr("nearby_fill_fail", _stat_host(url))
+                        continue
+                    data = resp.json()
+                    if data.get("remark"):
+                        # Overpass timeout arrives as 200 + remark with a truncated
+                        # element list — never cache that as the truth.
+                        last = f"{url}: remark {str(data['remark'])[:80]}"
+                        await _stat_incr("nearby_fill_fail", _stat_host(url))
+                        continue
+                    elements = _nearby_compact(data.get("elements", []))
+                    await _nearby_put(key, elements)
+                    _NEARBY_FAILS.pop(key, None)
+                    try:
+                        from ..event_bus import _get_client
+                        c = _get_client()
+                        if c is not None:
+                            await c.delete(_NEARBY_PREFIX + "fails:" + key)
+                    except Exception:
+                        pass
+                    await _stat_incr("nearby_fill_ok", _stat_host(url))
+                    logger.info(f"osm/nearby filled {key}: {len(elements)} named elements via {url}")
+                    return
+                except Exception as e:
+                    last = f"{url}: {type(e).__name__} {e}"
+                    await _stat_incr("nearby_fill_fail", _stat_host(url))
+        # all mirrors failed
+        _NEARBY_FAILS[key] = _NEARBY_FAILS.get(key, 0) + 1
+        try:
+            from ..event_bus import _get_client
+            c = _get_client()
+            if c is not None:
+                k = _NEARBY_PREFIX + "fails:" + key
+                await c.incr(k)
+                await c.expire(k, 900)
+        except Exception:
+            pass
+        await _stat_incr("nearby_fill_failed_all")
+        logger.warning(f"osm/nearby fill {key} failed on all mirrors (attempt {_NEARBY_FAILS[key]}). Last: {last}")
+        attempt = _NEARBY_FAILS[key]
+        if attempt <= len(_NEARBY_RETRY_DELAYS):
+            delay = _NEARBY_RETRY_DELAYS[attempt - 1]
+
+            async def _later():
+                await asyncio.sleep(delay)
+                if await _nearby_get(key) is not None:
+                    return
+                if key in _NEARBY_FILLING or not await _nearby_claim(key):
+                    return
+                _NEARBY_FILLING.add(key)
+                await _stat_incr("nearby_fill_retry")
+                await _nearby_fill(key, clat, clng, bucket)
+            asyncio.create_task(_later())
+    finally:
+        _NEARBY_FILLING.discard(key)
+
+
+def _nearby_answer(lat, lng, radius_m, elements, kinds):
+    # Stored elements carry lat/lon at top level for every OSM type; present
+    # them to the shared parser in node form (it only reads coordinates, tags, id).
+    as_nodes = [{"type": "node", "id": e.get("id"), "lat": e.get("lat"),
+                 "lon": e.get("lon"), "tags": e.get("tags") or {}} for e in elements]
+    rows = _parse_elements(lat, lng, as_nodes)
+    rows = [r for r in rows if r["distance_m"] <= radius_m + _NEARBY_MARGIN_M]
+    return _apply_kinds(rows, kinds)
+
+
 @router.get("/nearby")
 async def osm_nearby(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters (max 2000)"),
-    budget_s: float = Query(12.0, ge=0.5, le=30.0, description="TOTAL time budget across all mirrors, not per mirror — the realtime guide waits synchronously"),
+    budget_s: float = Query(4.0, ge=0.0, le=11.0, description="how long the CALLER waits for a cold cell before getting `filling`; the fill itself runs in the background with its own, larger budget. Keep below your client timeout."),
     kinds: Optional[str] = Query(None, description="comma-separated category filter, e.g. 'monument,attraction,museum,artwork,park'; substring match on the classified category"),
 ):
+    """Nearby named OSM features, from a shared per-cell cache.
+
+    Warm cell → answered immediately (`cached: true`), distances and `kinds`
+    computed for THIS caller. Cold cell → a background fill starts, the caller
+    waits up to `budget_s`; if the fill is not done by then the answer is
+    `filling: true` with an empty list — "not known yet", never "nothing here".
+    A cell whose fill failed three times in a row answers `degraded: true`.
     """
-    Query nearby named features from OpenStreetMap via Overpass.
+    key, clat, clng, bucket = _nearby_cell(lat, lng, radius_m)
+    q = {"lat": lat, "lng": lng, "radius_m": radius_m}
+    await _stat_incr("nearby_total")
 
-    Returns buildings, amenities, shops, tourism POIs, historic sites,
-    leisure facilities, and natural features within the given radius.
+    hit = await _nearby_get(key)
+    if hit is not None:
+        feats = _nearby_answer(lat, lng, radius_m, hit, kinds)
+        return {"features": feats, "count": len(feats), "cached": True, "query": q}
 
-    Results are cached server-side (1h TTL, ~110m grid) for efficiency.
-    """
-    global _last_overpass_request
-
-    key = _cache_key(lat, lng, radius_m)
-
-    # Cache hit
-    if key in _cache and (time.time() - _cache_ts.get(key, 0)) < _CACHE_TTL:
-        cached = _cache[key]
-        return {**cached, "cached": True}
-
-    # Rate limit
-    now = time.time()
-    wait = _OVERPASS_MIN_INTERVAL - (now - _last_overpass_request)
-    if wait > 0:
-        import asyncio
-        await asyncio.sleep(wait)
-
-    _last_overpass_request = time.time()
-
-    # Query Overpass — try multiple mirrors with failover
-    query = _build_query(lat, lng, radius_m)
-    data = None
-    last_error = ""
-    # The budget is for the WHOLE call, not per mirror. Three mirrors at 2 s each
-    # is 6 s, which is exactly what a caller asking for "at most 2 s" does not
-    # want — and it is where the 5 s per turn in the realtime guide came from:
-    # two mirrors timing out before the third answered, not one slow request.
-    # Each mirror gets a SHARE of the remaining budget, not all of it.
-    #
-    # Giving the first mirror the whole budget looks harmless until a mirror
-    # stops refusing and starts hanging: it then absorbs every second and the
-    # healthy mirrors are never tried. That is why raising the budget did not
-    # help — 5 s, 8 s and 12 s all returned nothing after exactly that long,
-    # because the same dead first mirror ate all of it. (GuideDevBot's
-    # measurement, Brussels, 2026-09-05 — the observation that did not fit.)
-    deadline = time.monotonic() + budget_s
-    async with httpx.AsyncClient() as client:
-        for idx, url in enumerate(OVERPASS_URLS):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.1:
-                last_error = f"budget of {budget_s}s exhausted before {url}"
-                break
-            left = len(OVERPASS_URLS) - idx
-            share = max(0.5, remaining / left)
-            try:
-                resp = await client.post(
-                    url,
-                    data={"data": query},
-                    headers={"User-Agent": "artrack-api/1.0 (audio-guide)"},
-                    timeout=share,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                break  # success
-            except Exception as e:
-                last_error = f"{url}: {e}"
-                continue  # try next mirror while the budget lasts
-
-    if data is None:
-        # NOT a 5xx. The endpoint did its job; the external service did not, and
-        # the caller can act on that — "I could not look" is usable, an error is
-        # not. A realtime guide that gets a 500 goes down its error path and says
-        # nothing at all, which is worse than narrating without surroundings.
-        logger.warning(f"osm/nearby: all mirrors failed at {lat},{lng}. Last: {last_error}")
-        await _stat_incr("nearby_total")
+    fails = await _nearby_fail_count(key)
+    if fails >= 3:
         await _stat_incr("nearby_degraded")
         return {"features": [], "count": 0, "cached": False, "degraded": True,
-                "degraded_reason": f"all Overpass mirrors failed: {str(last_error)[:160]}",
-                "query": {"lat": lat, "lng": lng, "radius_m": radius_m}}
+                "degraded_reason": f"{fails} consecutive fill failures (Overpass unavailable)",
+                "query": q}
 
-    # Overpass signals a server-side timeout with HTTP 200 and a `remark`, not
-    # with an error status: the body then carries few or no elements. Without
-    # this flag that arrives as "there is nothing here", which is the one answer
-    # a guide must not give confidently. (GuideDevBot measured 0 results after
-    # 24 s at radius 800; a second run returned 20 results in 8 s — same place.)
-    remark = data.get("remark")
-    degraded = bool(remark)
-    await _stat_incr("nearby_total")
-    if degraded:
-        await _stat_incr("nearby_degraded")
-    if degraded:
-        logger.warning(f"osm/nearby degraded at {lat},{lng} r={radius_m}: {remark}")
+    if key not in _NEARBY_FILLING and await _nearby_claim(key):
+        _NEARBY_FILLING.add(key)
+        await _stat_incr("nearby_fill_started")
+        asyncio.create_task(_nearby_fill(key, clat, clng, bucket))
 
-    # Parse + cache
-    features = _apply_kinds(_parse_elements(lat, lng, data.get("elements", [])), kinds)
-    result = {
-        "features": features,
-        "count": len(features),
-        "query": {"lat": lat, "lng": lng, "radius_m": radius_m},
-    }
-    if degraded:
-        result["degraded"] = True
-        result["degraded_reason"] = str(remark)[:200]
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        hit = await _nearby_get(key)
+        if hit is not None:
+            feats = _nearby_answer(lat, lng, radius_m, hit, kinds)
+            return {"features": feats, "count": len(feats), "cached": False,
+                    "waited": True, "query": q}
 
-    if not degraded:
-        # A truncated result must never be cached: it would freeze "nothing here"
-        # for an hour at a place that is actually full of sights.
-        _cache[key] = result
-        _cache_ts[key] = time.time()
-        _evict_oldest()
-
-    return {**result, "cached": False}
+    await _stat_incr("nearby_filling")
+    return {"features": [], "count": 0, "cached": False, "filling": True, "query": q}
 
 
 @router.get("/nearby/compact")
@@ -306,7 +422,7 @@ async def osm_nearby_compact(
     lat: float = Query(..., description="Latitude"),
     lng: float = Query(..., description="Longitude"),
     radius_m: int = Query(200, ge=10, le=2000, description="Search radius in meters"),
-    budget_s: float = Query(6.0, ge=0.5, le=30.0, description="TOTAL time budget across all mirrors. 6 s covers the ~5 s a full answer really takes and still leaves the third mirror room; pass a smaller value per call if a given caller prefers speed over surroundings"),
+    budget_s: float = Query(6.0, ge=0.0, le=11.0, description="TOTAL time budget across all mirrors. 6 s covers the ~5 s a full answer really takes and still leaves the third mirror room; pass a smaller value per call if a given caller prefers speed over surroundings"),
     kinds: Optional[str] = Query(None, description="comma-separated category filter, same as /nearby"),
 ):
     """
@@ -344,6 +460,8 @@ async def osm_nearby_compact(
     if data.get("degraded"):
         out["degraded"] = True
         out["degraded_reason"] = data.get("degraded_reason")
+    if data.get("filling"):
+        out["filling"] = True
     return out
 
 
@@ -771,14 +889,23 @@ async def osm_stats(
         failed_cells = await total("fill_failed_all")
         nearby_total = await total("nearby_total")
         nearby_degraded = await total("nearby_degraded")
+        nearby_filling = await total("nearby_filling")
+        nb_started = await total("nearby_fill_started")
+        nb_retry = await total("nearby_fill_retry")
+        nb_failed_all = await total("nearby_fill_failed_all")
+        nb_ok = sum([await total("nearby_fill_ok", m) for m in mirrors])
 
+        within_retries = await total("fill_retry")
         out.update({
             "available": True,
             "within": {"started": started, "completed": completed,
-                       "failed_all_mirrors": failed_cells,
+                       "failed_all_mirrors": failed_cells, "retries": within_retries,
                        "open": max(0, started - completed - failed_cells)},
             "nearby": {"requests": nearby_total, "degraded": nearby_degraded,
-                       "degraded_share": round(nearby_degraded / nearby_total, 3) if nearby_total else None},
+                       "filling": nearby_filling,
+                       "degraded_share": round(nearby_degraded / nearby_total, 3) if nearby_total else None,
+                       "fills": {"started": nb_started, "completed": nb_ok,
+                                 "failed_all_mirrors": nb_failed_all, "retries": nb_retry}},
             "mirrors": per_mirror,
         })
         # An empty window is NOT a health statement — say so instead of implying "fine".
