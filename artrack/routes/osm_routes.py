@@ -595,6 +595,38 @@ async def _within_claim(key: str) -> bool:
     return True
 
 
+_WITHIN_RETRY_DELAYS = (20.0, 60.0)   # after the 1st and 2nd all-mirror failure
+
+
+def _within_schedule_retry(key: str, lat: float, lng: float, include_boundaries: bool) -> None:
+    """Retry a failed fill on its own instead of waiting for the next visitor.
+
+    Before this, a cell whose fill died on all mirrors (Overpass 504 under load)
+    was only retried when the next request arrived. Florence, 2026-09-25: first
+    call 21:20:17, fail 21:20:55, next call 21:22:04, fail 21:22:26, success only
+    on the third request at 21:23:16 — to the consumer it looked like a fill
+    hanging for minutes. Two spaced retries, still behind the shared lock, keep
+    the load on Overpass bounded while the cell usually warms before the guide
+    asks again.
+    """
+    attempt = _WITHIN_FAILS.get(key, 0)
+    if attempt < 1 or attempt > len(_WITHIN_RETRY_DELAYS):
+        return
+    delay = _WITHIN_RETRY_DELAYS[attempt - 1]
+
+    async def _later():
+        await asyncio.sleep(delay)
+        if await _within_cache_get(key) is not None:
+            return
+        if key in _WITHIN_FILLING or not await _within_claim(key):
+            return
+        _WITHIN_FILLING.add(key)
+        await _stat_incr("fill_retry")
+        await _within_fill(key, lat, lng, include_boundaries)
+
+    asyncio.create_task(_later())
+
+
 async def _within_fill(key: str, lat: float, lng: float, include_boundaries: bool) -> None:
     """Fetch one cell's enclosing areas and put them in the cache."""
     query = (f"[out:json][timeout:20];is_in({lat},{lng})->.a;"
@@ -641,6 +673,7 @@ async def _within_fill(key: str, lat: float, lng: float, include_boundaries: boo
             await _within_note_failure(key)
             _WITHIN_STATS["failed"] += 1
             await _stat_incr("fill_failed_all")
+            _within_schedule_retry(key, lat, lng, include_boundaries)
             logger.warning(f"osm/within fill {key} failed on all mirrors (attempt "
                            f"{_WITHIN_FAILS[key]}). Last: {last}")
     except Exception as e:
