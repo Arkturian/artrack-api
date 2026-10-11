@@ -1,3 +1,4 @@
+import re
 from fastapi import HTTPException, Header, Depends, Request
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
@@ -91,6 +92,22 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
 
     return None
 
+# POST endpoints that only compute over stored data (no writes). Public
+# clients need them, so a read-only key may call exactly these.
+_READONLY_SAFE_POST = (
+    re.compile(r"^/snap/\d+/snap/?$"),
+    re.compile(r"^/tracks/\d+/context-at/?$"),
+)
+
+
+def _is_readonly_safe_post(request: Request) -> bool:
+    """True if a read-only key may issue this non-GET request."""
+    if request.method != "POST":
+        return False
+    path = request.url.path
+    return any(rx.match(path) for rx in _READONLY_SAFE_POST)
+
+
 def get_current_user(
     request: Request,
     api_key: str = Header(None, alias="X-API-KEY"),
@@ -104,7 +121,11 @@ def get_current_user(
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if getattr(user, "_readonly_key", False) and request.method not in ("GET", "HEAD", "OPTIONS"):
+    if (
+        getattr(user, "_readonly_key", False)
+        and request.method not in ("GET", "HEAD", "OPTIONS")
+        and not _is_readonly_safe_post(request)
+    ):
         raise HTTPException(status_code=403, detail="Read-only API key: write operations are not allowed")
     return user
 
