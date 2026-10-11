@@ -71,6 +71,7 @@ def verify_api_key(api_key: str, db: Session) -> Optional[User]:
         # Update last active and return
         user.last_active_at = datetime.utcnow()
         db.commit()
+        user._master_key = True
         return user
     
     # Check user API keys
@@ -108,6 +109,42 @@ def _is_readonly_safe_post(request: Request) -> bool:
     return any(rx.match(path) for rx in _READONLY_SAFE_POST)
 
 
+_master_use_redis = None
+
+
+def _note_master_key_use(request: Request) -> None:
+    """Count who still authenticates with the master key (Issue #2385).
+
+    Inventory for the key rotation: one Redis hash per day, field =
+    origin | client ip | user agent | first path segment. Never raises.
+    """
+    global _master_use_redis
+    try:
+        if _master_use_redis is None:
+            import redis
+
+            from .config import settings as _settings
+
+            _master_use_redis = redis.Redis.from_url(
+                _settings.REDIS_URL,
+                decode_responses=True,
+                socket_timeout=0.3,
+                socket_connect_timeout=0.3,
+            )
+        h = request.headers
+        ip = (h.get("x-forwarded-for") or "").split(",")[0].strip() or (
+            request.client.host if request.client else "?"
+        )
+        origin = (h.get("origin") or h.get("referer") or "-")[:80]
+        agent = (h.get("user-agent") or "-")[:60]
+        seg = "/" + request.url.path.strip("/").split("/")[0]
+        key = "artrack:masterkey:use:" + datetime.utcnow().strftime("%Y%m%d")
+        _master_use_redis.hincrby(key, f"{origin} | {ip} | {agent} | {seg}", 1)
+        _master_use_redis.expire(key, 30 * 86400)
+    except Exception:
+        pass
+
+
 def get_current_user(
     request: Request,
     api_key: str = Header(None, alias="X-API-KEY"),
@@ -121,6 +158,8 @@ def get_current_user(
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if getattr(user, "_master_key", False):
+        _note_master_key_use(request)
     if (
         getattr(user, "_readonly_key", False)
         and request.method not in ("GET", "HEAD", "OPTIONS")
