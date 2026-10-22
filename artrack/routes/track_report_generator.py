@@ -94,7 +94,7 @@ def closest_point_on_polyline(poly, lat, lon):
     return (min_dist, best_along)
 
 
-def generate_track_report(track_id, show_descriptions=False, api_key="Inetpass1", base_url="https://api.arkturian.com/artrack"):
+def generate_track_report(track_id, show_descriptions=False, api_key="", base_url="https://api.arkturian.com/artrack"):
     """
     Generate complete track structure report.
 

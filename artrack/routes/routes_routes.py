@@ -1179,7 +1179,7 @@ async def get_track_structure_report(
         report_text = generate_track_report(
             track_id=track_id,
             show_descriptions=full,
-            api_key=settings.API_KEY,
+            api_key=settings.AI_API_KEY,
             base_url=settings.AI_BASE_URL.rstrip("/"),
         )
     except Exception as exc:
@@ -1359,7 +1359,7 @@ async def generate_route_intro(
 
         # AI Service Configuration
         AI_SERVICE_URL = "https://api-ai.arkturian.com"
-        AI_API_KEY = "Inetpass1" # Using internal key
+        AI_API_KEY = settings.AI_INTERNAL_API_KEY
         HEADERS = {
             "X-API-KEY": AI_API_KEY,
             "Content-Type": "application/json"

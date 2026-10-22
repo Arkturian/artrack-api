@@ -43,7 +43,7 @@ PARTNER_ID = "artrack"
 # internal API key (same one used for ai-api). Set on the httpx.Client so it rides on
 # every request (list/detail GETs + create/update/delete). Without this, all narration
 # saves 401 silently → "Failed to persist".
-_AUTH_HEADERS = {"X-API-KEY": settings.API_KEY}
+_AUTH_HEADERS = {"X-API-KEY": settings.CONTENT_API_KEY}
 
 # Read vs write timeouts, deliberately different.
 #

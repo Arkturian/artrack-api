@@ -7,8 +7,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ai_config import ai_config, AIAnalysisMode
 
-# Use the hardcoded API key from main.py for internal API calls
-INTERNAL_API_KEY = "Inetpass1"
+from artrack.config import settings
+
+INTERNAL_API_KEY = settings.AI_INTERNAL_API_KEY
 API_BASE_URL = "http://127.0.0.1:8001"  # Internal communication
 
 async def analyze_content_with_chatgpt(

@@ -15,7 +15,7 @@ track_report_generator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(track_report_generator)
 generate_track_report = track_report_generator.generate_track_report
 
-API_KEY = "Inetpass1"
+API_KEY = os.environ.get("API_KEY", "")
 BASE_URL = "https://api.arkturian.com/artrack"
 
 

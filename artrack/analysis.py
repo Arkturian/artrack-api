@@ -14,7 +14,7 @@ from .database import get_db
 class AnalysisService:
     def __init__(self):
         self.ai_base_url = settings.AI_BASE_URL
-        self.api_key = settings.API_KEY
+        self.api_key = settings.AI_API_KEY
         self.timeout = settings.ANALYSIS_TIMEOUT
 
     async def _call_ai_service(self, endpoint: str, payload: dict) -> dict:

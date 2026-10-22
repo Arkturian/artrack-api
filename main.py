@@ -14,6 +14,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
+from artrack.config import settings
+
+# Ohne die Schluessel aus der Unit-Umgebung nicht starten (Issue #2385).
+_missing = settings.missing_secrets()
+if _missing:
+    raise RuntimeError(f"artrack-api: fehlende Einstellungen in der Umgebung: {', '.join(_missing)}")
+
 from artrack.database import engine, Base
 
 # Import all models BEFORE creating tables to ensure relationships work

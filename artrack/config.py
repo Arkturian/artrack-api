@@ -34,7 +34,21 @@ class Settings:
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
     ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
-    API_KEY: str = os.getenv("API_KEY", "Inetpass1")
+    # Eingehender Master-Schluessel von ARTrack. Kein Default mehr: Der alte
+    # stand im oeffentlichen Repo (Issue #2385). Fehlt er in der
+    # Unit-Umgebung, startet der Dienst nicht (main.py).
+    API_KEY: str = os.getenv("API_KEY", "")
+    # Signier-Geheimnis der JWTs, getrennt vom API-Schluessel.
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "")
+    # Ausgehende Schluessel. Sie gehoeren den Zieldiensten, nicht ARTrack, und
+    # duerfen deshalb nicht am eigenen Master haengen.
+    CONTENT_API_KEY: str = os.getenv("CONTENT_API_KEY", "")
+    AI_API_KEY: str = os.getenv("AI_API_KEY", "")
+    AI_INTERNAL_API_KEY: str = os.getenv("AI_INTERNAL_API_KEY", "")
+    REQUIRED_SECRETS = ("API_KEY", "JWT_SECRET", "CONTENT_API_KEY", "AI_API_KEY", "AI_INTERNAL_API_KEY")
+
+    def missing_secrets(self) -> list:
+        return [name for name in self.REQUIRED_SECRETS if not getattr(self, name)]
     # Public Firebase project identifier used to verify iOS ID tokens. This is
     # not a credential and can be overridden for another deployment.
     FIREBASE_PROJECT_ID: str = os.getenv(

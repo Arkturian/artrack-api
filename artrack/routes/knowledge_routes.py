@@ -29,6 +29,7 @@ import logging
 import uuid
 import asyncio
 
+from ..config import settings
 from ..database import get_db, SessionLocal
 from ..models import Track, Waypoint, TrackRoute
 from ..auth import get_current_user, User
@@ -83,7 +84,7 @@ def _set_job(job_id: str, job_data: Dict):
     _save_jobs(jobs)
 
 # AI API endpoint
-INTERNAL_API_KEY = "Inetpass1"
+INTERNAL_API_KEY = settings.AI_INTERNAL_API_KEY
 AI_API_BASE = "https://api-ai.arkturian.com"
 
 
