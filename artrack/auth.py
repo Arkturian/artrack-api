@@ -145,12 +145,25 @@ def _note_master_key_use(request: Request) -> None:
         pass
 
 
+def _bearer_user(authorization: Optional[str], db: Session) -> Optional[User]:
+    """Person signed in via auth-api (dashboard). None when no Bearer header."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    from .auth_oauth import verify_bearer, user_for_claims
+    return user_for_claims(verify_bearer(authorization[7:].strip()), db)
+
+
 def get_current_user(
     request: Request,
     api_key: str = Header(None, alias="X-API-KEY"),
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> User:
-    """Get current user from API key"""
+    """Get current user from API key, or from an auth-api Bearer token"""
+    if not api_key:
+        bearer = _bearer_user(authorization, db)
+        if bearer is not None:
+            return bearer
     user = verify_api_key(api_key, db)
     if not user:
         raise HTTPException(
@@ -170,9 +183,15 @@ def get_current_user(
 
 def get_current_user_optional(
     api_key: str = Header(None, alias="X-API-KEY"),
+    authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> Optional[User]:
-    """Get current user from API key (optional - returns None if not authenticated)"""
+    """Get current user from API key or Bearer (optional - returns None if not authenticated)"""
+    if not api_key and authorization:
+        try:
+            return _bearer_user(authorization, db)
+        except HTTPException:
+            return None
     return verify_api_key(api_key, db)
 
 def get_user_by_email(db: Session, email: str) -> Optional[User]:

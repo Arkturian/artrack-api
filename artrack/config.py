@@ -49,6 +49,15 @@ class Settings:
 
     def missing_secrets(self) -> list:
         return [name for name in self.REQUIRED_SECRETS if not getattr(self, name)]
+    # Anmeldung von Menschen ueber auth-api (OAuth 2.1 + PKCE, Post #5579).
+    # Ohne AUTH_CLIENT_ID ist der Bearer-Weg aus, X-API-KEY bleibt unberuehrt.
+    AUTH_API_BASE: str = os.getenv("AUTH_API_BASE", "https://auth-api.arkturian.com").rstrip("/")
+    AUTH_CLIENT_ID: str = os.getenv("AUTH_CLIENT_ID", "")
+    # Token-Form ohne https:// (auth-api token_service), nicht die Discovery-Form.
+    AUTH_ISSUER: str = os.getenv("AUTH_ISSUER", "auth-api.arkturian.com")
+    # Bis das RBAC-System "artrack" steht: auth-api-sub-Werte mit Admin-Recht.
+    AUTH_ADMIN_SUBS: list = [s.strip() for s in os.getenv("AUTH_ADMIN_SUBS", "").split(",") if s.strip()]
+    AUTH_ADMIN_ROLE: str = os.getenv("AUTH_ADMIN_ROLE", "artrack-admin")
     # Public Firebase project identifier used to verify iOS ID tokens. This is
     # not a credential and can be overridden for another deployment.
     FIREBASE_PROJECT_ID: str = os.getenv(

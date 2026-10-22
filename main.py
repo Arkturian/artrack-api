@@ -26,6 +26,7 @@ from artrack.database import engine, Base
 # Import all models BEFORE creating tables to ensure relationships work
 from artrack import models
 from artrack import collaboration_models
+from artrack import auth_oauth
 
 # ---------------------------------------------------------------------------
 # Logging — route artrack.* app loggers (incl. artrack.event_bus, used by the
@@ -93,6 +94,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth_routes.router, prefix="/auth", tags=["Authentication"])
+app.include_router(auth_oauth.router)
 # nearby + bbox routes registered FIRST so /tracks/nearby and
 # /tracks/bbox/recompute-all aren't shadowed by the
 # GET /tracks/{track_id} wildcard from track_routes below.
