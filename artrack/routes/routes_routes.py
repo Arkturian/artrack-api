@@ -2822,8 +2822,107 @@ async def set_waypoint_knowledge_links(
     return {"track_id": track_id, "updated": updated, "skipped": skipped}
 
 
+def _knowledge_ids_of(meta: dict) -> list:
+    kids = meta.get("knowledge_ids")
+    if isinstance(kids, list):
+        return kids
+    return [meta["knowledge_id"]] if meta.get("knowledge_id") is not None else []
+
+
+def _by_knowledge_item(w, meta: dict, knowledge_id: int, primary_only: bool):
+    """One waypoint row for the by-knowledge index, or None when filtered out."""
+    # Sighting cluster role for this species (set by the recluster pass).
+    # Unclustered (no entry) defaults to primary so existing data is never hidden.
+    _kc = (meta.get("knowledge_clusters") or {}).get(str(knowledge_id)) or {}
+    is_primary = bool(_kc.get("is_primary", True))
+    if primary_only and not is_primary:
+        return None
+    return {
+        "id": w.id,
+        "track_id": w.track_id,
+        "lat": w.latitude,
+        "lng": w.longitude,
+        "waypoint_type": w.waypoint_type,
+        "title": meta.get("title"),
+        "knowledge_ids": _knowledge_ids_of(meta),
+        "is_primary": is_primary,
+        "cluster_id": _kc.get("cluster_id"),
+        "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
+        "source_collection": meta.get("source_collection"),
+        # Explicit, so a consumer that opts into archived rows can still tell
+        # the two apart instead of inferring it from their absence.
+        "archived": bool(getattr(w, "archived", False)),
+    }
+
+
+def _linked_knowledge_keys(meta: dict) -> set:
+    """String ids a waypoint is linked to: knowledge_ids[] plus the legacy scalar."""
+    ids = meta.get("knowledge_ids")
+    keys = {str(x) for x in ids} if isinstance(ids, list) else set()
+    if meta.get("knowledge_id") is not None:
+        keys.add(str(meta["knowledge_id"]))
+    return keys
+
+
+def _by_knowledge_query(db: Session, track_id: Optional[int], include_archived: bool):
+    q = db.query(Waypoint)
+    if track_id is not None:
+        q = q.filter(Waypoint.track_id == track_id)
+    if not include_archived:
+        q = q.filter(Waypoint.archived == False)  # noqa: E712
+    return q
+
+
+@router.get("/waypoints/by-knowledge")
+def get_waypoints_by_knowledge_batch(
+    ids: str,
+    track_id: Optional[int] = None,
+    primary_only: bool = False,
+    include_archived: bool = False,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Batch form of /waypoints/by-knowledge/{knowledge_id}: `ids=12,34,56`
+    (max 500). One scan of the track instead of one per id — clients that
+    resolved each species separately fired ~20 parallel full-track scans and
+    exhausted the DB pool (2026-10-22).
+
+    Returns: {primary_only, include_archived, results: {"<id>": {knowledge_id,
+              count, waypoints: [...]}}} — every requested id is present,
+              unknown ids with count 0.
+    """
+    wanted = []
+    for part in ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            raise HTTPException(status_code=400, detail=f"ids: '{part}' ist keine Zahl")
+        if part not in wanted:
+            wanted.append(part)
+    if not wanted:
+        raise HTTPException(status_code=400, detail="ids fehlt")
+    if len(wanted) > 500:
+        raise HTTPException(status_code=400, detail="ids: hoechstens 500")
+    wanted_set = set(wanted)
+    results = {k: [] for k in wanted}
+    for w in _by_knowledge_query(db, track_id, include_archived).all():
+        meta = w.metadata_json or {}
+        linked = _linked_knowledge_keys(meta) & wanted_set
+        for k in linked:
+            item = _by_knowledge_item(w, meta, int(k), primary_only)
+            if item is not None:
+                results[k].append(item)
+    return {
+        "primary_only": primary_only,
+        "include_archived": include_archived,
+        "results": {k: {"knowledge_id": int(k), "count": len(v), "waypoints": v} for k, v in results.items()},
+    }
+
+
 @router.get("/waypoints/by-knowledge/{knowledge_id}")
-async def get_waypoints_by_knowledge(
+def get_waypoints_by_knowledge(
     knowledge_id: int,
     track_id: Optional[int] = None,
     primary_only: bool = False,
@@ -2835,6 +2934,7 @@ async def get_waypoints_by_knowledge(
     Return all waypoints (screen_points/POIs) linked to a given knowledge_id —
     i.e. every place where this knowledge object (e.g. a species) is shown.
     Reverse of Knowledge's geo-lookup. Optionally constrain to one track.
+    For several ids use GET /waypoints/by-knowledge?ids=… (one scan).
 
     Archived waypoints are hidden by default (`include_archived=true` to see
     them), consistent with every other read path. Without this the index kept
@@ -2846,51 +2946,18 @@ async def get_waypoints_by_knowledge(
     Returns: {knowledge_id, count, waypoints: [{id, track_id, lat, lng,
               waypoint_type, title, assets, source_collection, archived}]}
     """
-    q = db.query(Waypoint)
-    if track_id is not None:
-        q = q.filter(Waypoint.track_id == track_id)
-    if not include_archived:
-        q = q.filter(Waypoint.archived == False)  # noqa: E712
-
     # Match against the canonical knowledge_ids[] list AND the legacy scalar
     # knowledge_id (1:1 records). Done in Python for robustness across backends
     # and JSON shapes (list-contains is awkward/non-portable in json_extract).
-    def _linked(meta: dict) -> bool:
-        ids = meta.get("knowledge_ids")
-        if isinstance(ids, list) and any(str(x) == str(knowledge_id) for x in ids):
-            return True
-        return str(meta.get("knowledge_id")) == str(knowledge_id)
-
-    rows = [w for w in q.all() if _linked(w.metadata_json or {})]
-
+    key = str(knowledge_id)
     out = []
-    for w in rows:
+    for w in _by_knowledge_query(db, track_id, include_archived).all():
         meta = w.metadata_json or {}
-        kids = meta.get("knowledge_ids")
-        if not isinstance(kids, list):
-            kids = [meta["knowledge_id"]] if meta.get("knowledge_id") is not None else []
-        # Sighting cluster role for this species (set by the recluster pass).
-        # Unclustered (no entry) defaults to primary so existing data is never hidden.
-        _kc = (meta.get("knowledge_clusters") or {}).get(str(knowledge_id)) or {}
-        is_primary = bool(_kc.get("is_primary", True))
-        if primary_only and not is_primary:
+        if key not in _linked_knowledge_keys(meta):
             continue
-        out.append({
-            "id": w.id,
-            "track_id": w.track_id,
-            "lat": w.latitude,
-            "lng": w.longitude,
-            "waypoint_type": w.waypoint_type,
-            "title": meta.get("title"),
-            "knowledge_ids": kids,
-            "is_primary": is_primary,
-            "cluster_id": _kc.get("cluster_id"),
-            "assets": [enrich_asset(a) for a in (meta.get("assets") or []) if isinstance(a, dict)],
-            "source_collection": meta.get("source_collection"),
-            # Explicit, so a consumer that opts into archived rows can still tell
-            # the two apart instead of inferring it from their absence.
-            "archived": bool(getattr(w, "archived", False)),
-        })
+        item = _by_knowledge_item(w, meta, knowledge_id, primary_only)
+        if item is not None:
+            out.append(item)
     return {
         "knowledge_id": knowledge_id,
         "count": len(out),
