@@ -20,6 +20,7 @@ from ..database import get_db
 from ..models import Track, TrackRoute, Waypoint
 from ..services import osm_network as on
 from ..services.route_status import DRAFT_POINT_TYPE, route_art, route_meta, route_status
+from ..services import route_transfer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -337,6 +338,35 @@ def replace_points(track_id: int, route_id: int, body: PointsBody, db: Session =
 
 class ReleaseBody(BaseModel):
     ersetzt_route_id: Optional[int] = Field(None, description="aktive Route, deren Geometrie ersetzt wird (ID bleibt)")
+    wegpunkte: bool = Field(True, description="Segmentmarker, Story-Points und POI-Snaps auf die neue Linie uebertragen")
+
+
+def _transfer_plan(db: Session, track: Track, target: TrackRoute, src: TrackRoute) -> dict:
+    old_coords = [[p.latitude, p.longitude] for p in _route_points(db, track, target.id)]
+    new_coords = [[p.latitude, p.longitude] for p in _route_points(db, track, src.id)]
+    wps = db.query(Waypoint).filter(
+        Waypoint.track_id == track.id,
+        ~Waypoint.waypoint_type.in_(POINT_TYPES),
+        Waypoint.archived.isnot(True),
+    ).all()
+    try:
+        return route_transfer.plan_transfer(wps, target.id, old_coords, new_coords), {w.id: w for w in wps}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.post("/{track_id}/routes/{route_id}/freigeben-vorschau")
+def release_preview(track_id: int, route_id: int, body: ReleaseBody, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """What a release onto `ersetzt_route_id` would do to the waypoints of that
+    route (segment markers moved, story points re-chained, POI snaps recomputed).
+    Nothing is written."""
+    track = _track_for_write(db, track_id, current_user)
+    src = _route(db, track_id, route_id)
+    if body.ersetzt_route_id is None:
+        return {"route_id": None, "segmentmarker": [], "story_points": [], "pois": [], "zusammenfassung": {}, "hinweis": "Ohne Zielroute werden keine Wegpunkte uebertragen"}
+    target = _route(db, track_id, body.ersetzt_route_id)
+    plan, _ = _transfer_plan(db, track, target, src)
+    return plan
 
 
 @router.post("/{track_id}/routes/{route_id}/freigeben")
@@ -371,6 +401,20 @@ def release(track_id: int, route_id: int, body: ReleaseBody, db: Session = Depen
         if len(_route_points(db, track, src.id)) < 2:
             raise HTTPException(status_code=422, detail="Entwurf hat weniger als 2 Punkte")
 
+        transfer = None
+        saved_before = None
+        if body.wegpunkte:
+            plan, by_id = _transfer_plan(db, track, target, src)
+            # Exact undo: the replaced line keeps the waypoint positions it had
+            saved_before = route_transfer.snapshot(by_id, plan)
+            saved = route_meta(src).get("wegpunkte_vorher")
+            if route_status(src) == "abgeloest" and route_meta(src).get("ersetzt_durch") == target.id and isinstance(saved, list):
+                changed = route_transfer.restore(by_id, saved, target.id, now)
+                transfer = {"geaendert": changed, "verfahren": "exakt zurueckgeholt"}
+            else:
+                changed = route_transfer.apply_transfer(by_id, plan, now)
+                transfer = {"geaendert": changed, "verfahren": "uebertragen", **plan["zusammenfassung"]}
+
         old = TrackRoute(
             track_id=track.id,
             created_by=current_user.id,
@@ -383,14 +427,16 @@ def release(track_id: int, route_id: int, body: ReleaseBody, db: Session = Depen
                 "ersetzt_durch": target.id,
                 "alte_geometrie_von": target.id,
                 "abgeloest_am": now,
+                **({"wegpunkte_vorher": saved_before} if saved_before is not None else {}),
             },
         )
         db.add(old)
         db.flush()
         _move_points(db, track, target.id, old.id, DRAFT_POINT_TYPE)
         _move_points(db, track, src.id, target.id, "gps_track")
-        src_meta = {k: v for k, v in route_meta(src).items() if k not in ("status", "ersetzt_durch", "alte_geometrie_von", "abgeloest_am")}
-        _set_meta(target, **src_meta, status="aktiv", freigegeben_am=now, vorgaenger_route_id=old.id)
+        src_meta = {k: v for k, v in route_meta(src).items() if k not in ("status", "ersetzt_durch", "alte_geometrie_von", "abgeloest_am", "wegpunkte_vorher")}
+        src_meta.update(status="aktiv", freigegeben_am=now, vorgaenger_route_id=old.id)
+        _set_meta(target, **src_meta)
         db.delete(src)
         db.commit()
     except HTTPException:
@@ -401,7 +447,7 @@ def release(track_id: int, route_id: int, body: ReleaseBody, db: Session = Depen
         logger.exception("Freigeben fehlgeschlagen (track %s, route %s)", track_id, route_id)
         raise HTTPException(status_code=500, detail="Freigeben fehlgeschlagen, nichts geaendert")
     _after_geometry_change(db, track_id)
-    return {"id": target.id, "status": "aktiv", "abgeloest_route_id": old.id}
+    return {"id": target.id, "status": "aktiv", "abgeloest_route_id": old.id, "wegpunkte": transfer}
 
 
 @router.post("/{track_id}/routes/{route_id}/verwerfen")
