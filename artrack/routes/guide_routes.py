@@ -8,6 +8,7 @@ from ..database import get_db
 from ..models import Track, Waypoint, TrackRoute, StorageObject
 from ..auth import get_current_user, User
 
+from ..services.route_status import guide_routes
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -445,7 +446,7 @@ def export_ios_guide_with_routes(
     default_radius = body.get("defaultRadius") or track_guide_config.get("defaultRadius") or 15
 
     # Load Routes (filter out segment markers with < 3 GPS points)
-    routes_db = db.query(TrackRoute).filter(TrackRoute.track_id == track_id).order_by(TrackRoute.id).all()
+    routes_db = guide_routes(db.query(TrackRoute).filter(TrackRoute.track_id == track_id).order_by(TrackRoute.id).all())
     routes_export = []
 
     for route_db in routes_db:
@@ -938,7 +939,7 @@ def create_segment_from_pois(
             raise HTTPException(status_code=404, detail="Route not found")
     else:
         # Auto-select first route
-        route = db.query(TrackRoute).filter(TrackRoute.track_id == track_id).first()
+        route = next(iter(guide_routes(db.query(TrackRoute).filter(TrackRoute.track_id == track_id).order_by(TrackRoute.id).all())), None)
         if not route:
             raise HTTPException(status_code=404, detail="No routes found for this track")
 

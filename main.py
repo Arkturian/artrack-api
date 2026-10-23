@@ -56,6 +56,7 @@ from artrack.routes import (
     sync_routes,
     segments_routes,
     routes_routes,
+    osm_route_routes,
     guide_routes,
     categories_routes,
     knowledge_routes,
@@ -107,6 +108,8 @@ app.include_router(gps_routes.router, prefix="/tracks", tags=["GPS"])
 app.include_router(snap_routes.router, prefix="/snap", tags=["Snap to Road"])
 app.include_router(sync_routes.router, prefix="/sync", tags=["Sync"])
 app.include_router(segments_routes.router, prefix="/segments", tags=["Segments"])
+# vor routes_routes: /routes/osm-generate darf nicht als /routes/{route_id} enden
+app.include_router(osm_route_routes.router, prefix="/tracks", tags=["OSM-Routen"])
 app.include_router(routes_routes.router, prefix="/tracks", tags=["Routes"])
 app.include_router(guide_routes.router, prefix="/guides", tags=["Audio Guides"])
 app.include_router(categories_routes.router, prefix="/categories", tags=["Categories"])

@@ -10,6 +10,7 @@ from ..auth import get_current_user
 from ..models import User, Track, Waypoint
 from ..collaboration_models import get_user_permissions
 
+from ..services.route_status import guide_routes
 router = APIRouter()
 
 
@@ -347,7 +348,7 @@ async def snap_poi(
     # Multi-route snap: Check distance to ALL routes
     from ..models import TrackRoute
 
-    routes = db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all())
     route_snaps = []
 
     for route in routes:
@@ -494,7 +495,7 @@ async def resnap_all_waypoints(
             # Re-snap using multi-route logic (same as snap_poi endpoint)
             from ..models import TrackRoute
 
-            routes = db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all()
+            routes = guide_routes(db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all())
             route_snaps = []
 
             for route_obj in routes:

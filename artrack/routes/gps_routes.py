@@ -317,10 +317,13 @@ async def get_gps_points(
     if not permissions.can_view:
         raise HTTPException(status_code=403, detail="No permission to view this track")
     
-    # Get GPS track points (only from track owner)
+    # Get GPS track points (only from track owner). With an explicit route
+    # filter, draft points (route_draft) are included: the editor loads drafts
+    # by id, every track-wide reader keeps seeing gps_track only.
+    explicit_route = route_id is not None or routeId is not None
     query = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
-        Waypoint.waypoint_type == "gps_track",
+        Waypoint.waypoint_type.in_(("gps_track", "route_draft")) if explicit_route else Waypoint.waypoint_type == "gps_track",
         Waypoint.created_by == track.created_by
     )
     if segment_id is not None:

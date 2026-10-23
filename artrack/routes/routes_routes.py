@@ -59,6 +59,7 @@ async def _get_has_3d(knowledge_ids) -> dict:
             pass  # graceful: misses simply absent → no marker, response never fails
     return out
 
+from ..services.route_status import guide_routes, route_art, route_status
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -259,7 +260,7 @@ def _get_membership_geometry(db: Session, track_id: int, track: Track):
     if cached and cached[0] > now:
         return cached[1], cached[2]
 
-    all_routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    all_routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
     all_gps = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
         Waypoint.waypoint_type == "gps_track",
@@ -399,6 +400,8 @@ class RouteItem(BaseModel):
     storage_object_ids: Optional[list[int]] = None
     storage_collection: Optional[dict] = None
     created_at: datetime
+    # status/art/quelle of OSM routes and water sections (route_status.py)
+    metadata_json: Optional[dict] = None
 
 # Detailed route data response
 class WaypointPoint(BaseModel):
@@ -456,14 +459,26 @@ class RouteOverview(BaseModel):
     total_waypoints: int
 
 @router.get("/{track_id}/routes", response_model=List[RouteItem])
-async def list_routes(track_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+async def list_routes(
+    track_id: int,
+    art: str = Query("weg", description="weg (Wanderrouten) | gewaesser (Gewaesser-Abschnitte)"),
+    alle: bool = Query(False, description="Auch Entwuerfe und abgeloeste Routen (Editor)"),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Routes of a track. Default: active walking routes only - the app view.
+    `art=gewaesser`: released water sections. `alle=true`: every route of the
+    requested art incl. drafts and replaced ones, for the editor."""
     track = db.query(Track).filter(Track.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
+    if art not in ("weg", "gewaesser"):
+        raise HTTPException(status_code=400, detail="art: weg oder gewaesser")
     routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
-    return [RouteItem(id=r.id, track_id=r.track_id, name=r.name, color=r.color, description=r.description, storage_object_ids=getattr(r, 'storage_object_ids', None), storage_collection=getattr(r, 'storage_collection', None), created_at=r.created_at) for r in routes]
+    routes = [r for r in routes if route_art(r) == art and (alle or route_status(r) == "aktiv")]
+    return [RouteItem(id=r.id, track_id=r.track_id, name=r.name, color=r.color, description=r.description, storage_object_ids=getattr(r, 'storage_object_ids', None), storage_collection=getattr(r, 'storage_collection', None), created_at=r.created_at, metadata_json=r.metadata_json or {}) for r in routes]
 
 @router.get("/{track_id}/routes/{route_id}/overview", response_model=RouteOverview)
 async def get_route_overview(
@@ -1212,7 +1227,7 @@ async def get_track_routes_overview(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for this track
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
 
     routes_data = []
 
@@ -1555,7 +1570,7 @@ async def get_all_pois_pretty(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for distance calculations
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
 
     # Build polylines per route
     route_polylines = {}
@@ -1673,7 +1688,7 @@ async def get_pois_near(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # 1. Build polylines per route (for snapping) — cached in-process per track.
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
     route_polylines = _get_track_polylines(db, track_id)
 
     # 2. Snap user position to closest route (or constrained route)
@@ -2348,7 +2363,7 @@ async def get_all_segments_pretty(
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all routes for distance calculations
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
 
     # Build polylines per route
     route_polylines = {}
@@ -2469,7 +2484,7 @@ async def get_route_ids(
     if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all())
 
     return {
         "track_id": track_id,
@@ -2495,7 +2510,7 @@ async def get_track_pretty(
     if not can_read_track(track, current_user):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    routes = db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all()
+    routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).order_by(TrackRouteModel.id.asc()).all())
 
     pretty_routes = []
 

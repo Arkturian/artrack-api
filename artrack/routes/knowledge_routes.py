@@ -44,6 +44,7 @@ from ..content_client import (
     NarrationVersionConflict,
 )
 
+from ..services.route_status import guide_routes
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ def _load_track_data(db: Session, track_id: int) -> Dict:
     """Load all routes, segments, and POIs for a track."""
 
     # Load all routes
-    routes = db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all()
+    routes = guide_routes(db.query(TrackRoute).filter(TrackRoute.track_id == track_id).all())
 
     # Load all waypoints (except GPS tracks)
     all_waypoints = db.query(Waypoint).filter(
