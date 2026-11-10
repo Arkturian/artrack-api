@@ -274,6 +274,23 @@ def get_user_permissions(track, user_id: int) -> TrackPermissions:
 MODERATION_TRUST_LEVELS = ("admin", "moderator")
 
 
+def can_write_waypoints(track, user, action: str) -> bool:
+    """Darf dieser Nutzer auf diesem Track Wegpunkte anlegen ("add"), aendern
+    ("edit") oder loeschen ("delete")?
+
+    Eigentuemer und admin/moderator wie bisher, dazu aktive Mitarbeiter mit dem
+    passenden Recht. Vorher kannten die Wegpunkt-Endpunkte keine Mitarbeiter:
+    ein Eintrag in track_collaborators gab Leserechte, aber jeder Schreibversuch
+    endete mit 403 (Anlass: Mitarbeiterzugang Track 30, 2026-11-10).
+    """
+    if track is None or user is None:
+        return False
+    if track.created_by == user.id or getattr(user, "trust_level", None) in MODERATION_TRUST_LEVELS:
+        return True
+    perms = get_user_permissions(track, user.id)
+    return bool({"add": perms.can_add_waypoints, "edit": perms.can_edit_waypoints, "delete": perms.can_delete_waypoints}.get(action))
+
+
 def can_read_track(track, user) -> bool:
     """Darf dieser Nutzer diesen Track LESEN?
 

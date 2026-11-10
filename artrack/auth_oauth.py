@@ -17,7 +17,7 @@ from typing import Optional
 
 import httpx
 import jwt
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -26,6 +26,12 @@ from .models import User
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth/oauth", tags=["auth"])
+
+
+def _get_db():
+    # Imported lazily: auth.py imports this module, database imports config
+    from .database import get_db
+    yield from get_db()
 
 _jwks_client: Optional[jwt.PyJWKClient] = None
 
@@ -76,10 +82,40 @@ def is_admin(claims: dict) -> bool:
     return False
 
 
+def _collaborator_user(claims: dict, db: Session) -> Optional[User]:
+    """The person's own ArTrack user, if it collaborates on at least one track.
+
+    Matched by e-mail (claim `email` plus `aliases`, case-insensitive). Access
+    is granted per track through track_collaborators, never globally.
+    """
+    from .collaboration_models import TrackCollaborator
+    emails = {str(e).strip().lower() for e in [claims.get("email"), *(claims.get("aliases") or [])] if e}
+    if not emails:
+        return None
+    for user in db.query(User).filter(User.email.in_(list(emails))).all():
+        active = db.query(TrackCollaborator).filter(
+            TrackCollaborator.user_id == user.id, TrackCollaborator.is_active == True  # noqa: E712
+        ).first()
+        if active:
+            return user
+    return None
+
+
 def user_for_claims(claims: dict, db: Session) -> User:
-    """Map a verified person to the ArTrack user they act as."""
+    """Map a verified person to the ArTrack user they act as.
+
+    Admins act as system@api (all tracks). Everyone else acts as their own
+    ArTrack user and only gets what track_collaborators grants them.
+    """
     if not is_admin(claims):
-        raise HTTPException(status_code=403, detail="Kein Zugang zu ARTrack fuer dieses Konto")
+        user = _collaborator_user(claims, db)
+        if user is None:
+            raise HTTPException(status_code=403, detail="Kein Zugang zu ARTrack fuer dieses Konto")
+        user.last_active_at = datetime.utcnow()
+        db.commit()
+        user._oauth_sub = claims.get("sub")
+        user._oauth_email = claims.get("email")
+        return user
     user = db.query(User).filter(User.email == "system@api").first()
     if not user:
         raise HTTPException(status_code=500, detail="system@api fehlt")
@@ -121,6 +157,7 @@ async def oauth_token(
     redirect_uri: Optional[str] = Form(None),
     code_verifier: Optional[str] = Form(None),
     refresh_token: Optional[str] = Form(None),
+    db: Session = Depends(_get_db),
 ):
     """Exchange an authorization code or refresh token at auth-api.
 
@@ -141,7 +178,7 @@ async def oauth_token(
     else:
         raise HTTPException(status_code=400, detail="grant_type nicht unterstuetzt")
     claims = verify_bearer(body.get("access_token", ""))
-    if not is_admin(claims):
+    if not is_admin(claims) and _collaborator_user(claims, db) is None:
         raise HTTPException(status_code=403, detail="Kein Zugang zu ARTrack fuer dieses Konto")
     return {
         "access_token": body.get("access_token"),

@@ -188,7 +188,12 @@ async def list_tracks(
     if visibility == "public":
         query = query.filter(Track.visibility == "public")
     elif visibility == "my" or visibility is None:
-        query = query.filter(Track.created_by == current_user.id)
+        # Own tracks plus tracks the user actively collaborates on
+        from ..collaboration_models import TrackCollaborator
+        shared = db.query(TrackCollaborator.track_id).filter(
+            TrackCollaborator.user_id == current_user.id, TrackCollaborator.is_active == True  # noqa: E712
+        )
+        query = query.filter((Track.created_by == current_user.id) | (Track.id.in_(shared)))
     else:
         # For other visibility levels, show only user's own tracks
         query = query.filter(Track.created_by == current_user.id)

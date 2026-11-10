@@ -41,7 +41,7 @@ logger = logging.getLogger("artrack.waypoints")
 # HEAD-probe the alternate host once (cached) so consumers don't have to know
 # where an asset lives. Graceful: any failure → no stamp → default behavior.
 import time as _time
-from artrack.collaboration_models import can_read_track
+from artrack.collaboration_models import can_write_waypoints, can_read_track
 _ASSET_HOST_CACHE: dict = {}            # asset_id(int) -> (expiry_epoch, host_or_None)
 _ASSET_HOST_TTL = 600                    # 10 min
 _STORAGE_ALT_HOST = os.getenv("ARTRACK_STORAGE_ALT_HOST", "https://api-storage.arkserver.arkturian.com")
@@ -96,7 +96,7 @@ async def create_waypoints(
     # Blocker for the swfme PoiOnboarding workflow (Tschepp/SWFME, 2026-08-16).
     # Deliberately NOT widened to any authenticated user: creation stays gated on
     # trust_level, so an ordinary key still cannot write into a foreign track.
-    if track.created_by != current_user.id and not _is_admin(current_user):
+    if not can_write_waypoints(track, current_user, "add"):
         raise HTTPException(status_code=403, detail="Access denied")
 
 
@@ -1348,7 +1348,9 @@ async def update_waypoint(
         raise HTTPException(status_code=404, detail="Waypoint not found")
 
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
+    # Public tracks are readable by all, writable only by owner, admin/moderator
+    # or collaborators with the right (was: any user on a public track).
+    if not track or not can_write_waypoints(track, current_user, "edit"):
         raise HTTPException(status_code=403, detail="Access denied")
 
     if update.description is not None:
@@ -1624,7 +1626,9 @@ async def attach_storage_to_waypoint(
     if not waypoint:
         raise HTTPException(status_code=404, detail="Waypoint not found")
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
+    # Public tracks are readable by all, writable only by owner, admin/moderator
+    # or collaborators with the right (was: any user on a public track).
+    if not track or not can_write_waypoints(track, current_user, "edit"):
         raise HTTPException(status_code=403, detail="Access denied")
     attached_ids: list = []
     skipped_items: list = []
@@ -1743,7 +1747,9 @@ async def delete_waypoint(
         raise HTTPException(status_code=404, detail="Waypoint not found")
 
     track = db.query(Track).filter(Track.id == waypoint.track_id).first()
-    if not track or (track.created_by != current_user.id and track.visibility == "private" and current_user.trust_level not in ("admin", "moderator")):
+    # Public tracks are readable by all, writable only by owner, admin/moderator
+    # or collaborators with the right (was: any user on a public track).
+    if not track or not can_write_waypoints(track, current_user, "delete"):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Capture before delete (waypoint is expired after commit).
