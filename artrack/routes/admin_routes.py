@@ -8,6 +8,7 @@ from sqlalchemy import func, desc
 from pathlib import Path
 from pydantic import BaseModel
 import os
+import re
 
 from ..database import get_db
 from ..models import User, Track, Waypoint, MediaFile, AnalysisJob, StorageObject
@@ -637,6 +638,28 @@ def admin_storage_list(
     return {"total": total, "items": items}
 
 
+HLS_MEDIA_ROOT = Path("/mnt/backup-disk/uploads/media")
+_HLS_JOB_ID_RE = re.compile(r"/media/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/master\.m3u8(?:[?#]|$)")
+
+
+def _hls_dir_for_url(hls_url: str) -> Optional[Path]:
+    """HLS job directory for a master.m3u8 URL, or None if it is not safe.
+
+    The job id must be a plain name (letters, digits, '_' and '-', no dots),
+    and the resolved directory must be a direct child of HLS_MEDIA_ROOT.
+    Anything else ('..', encoded separators, symlinks out of the root) is
+    rejected, so rmtree can never reach the root or anything above it.
+    """
+    m = _HLS_JOB_ID_RE.search(hls_url or "")
+    if not m:
+        return None
+    root = HLS_MEDIA_ROOT.resolve()
+    candidate = (HLS_MEDIA_ROOT / m.group(1)).resolve()
+    if candidate.parent != root or candidate == root:
+        return None
+    return candidate
+
+
 @router.delete("/storage/{object_id}", response_model=MessageResponse)
 def admin_storage_delete(
     object_id: int,
@@ -670,25 +693,21 @@ def admin_storage_delete(
     
     # Delete HLS files if they exist
     hls_deleted = False
-    if obj.hls_url:
-        try:
-            # Extract job ID from HLS URL to delete HLS directory
-            # HLS URL format: https://api.arkturian.com/uploads/storage/media/{job_id}/master.m3u8
-            import re
-            match = re.search(r'/media/([^/]+)/master\.m3u8', obj.hls_url)
-            if match:
-                hls_job_id = match.group(1)
-                hls_dir = f"/mnt/backup-disk/uploads/media/{hls_job_id}"
-                import shutil
-                from pathlib import Path
-                hls_path = Path(hls_dir)
-                if hls_path.exists():
+    hls_url = getattr(obj, "hls_url", None)  # column only exists on old SQLite schemas
+    if hls_url:
+        hls_path = _hls_dir_for_url(hls_url)
+        if hls_path is None:
+            print(f"⚠️ HLS-URL abgelehnt, nichts geloescht: {hls_url!r}")
+        else:
+            try:
+                if hls_path.is_dir() and not hls_path.is_symlink():
+                    import shutil
                     shutil.rmtree(hls_path)
-                    print(f"🗑️ Deleted HLS directory: {hls_dir}")
+                    print(f"🗑️ Deleted HLS directory: {hls_path}")
                     hls_deleted = True
-        except Exception as e:
-            print(f"⚠️ Could not delete HLS files: {e}")
-    
+            except Exception as e:
+                print(f"⚠️ Could not delete HLS files: {e}")
+
     # Delete original file(s)
     try:
         generic_storage.delete(obj.object_key)
