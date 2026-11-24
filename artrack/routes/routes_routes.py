@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 from datetime import datetime
 import logging
 import math
+import numpy as np
 import time
 
 from ..database import get_db
@@ -60,6 +61,19 @@ async def _get_has_3d(knowledge_ids) -> dict:
     return out
 
 from ..services.route_status import guide_routes, route_art, route_status
+from ..services.track_cache import MISS, TrackCache, track_rev
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, Response
+
+# Encoded route views (pretty, waypoint-ids) per track revision. Both load
+# every waypoint of the track and project it onto the route geometry.
+_ROUTE_VIEW_CACHE = TrackCache("route_views", max_entries=128)
+
+
+def _cache_view(rev, key, payload) -> Response:
+    body = JSONResponse(content=jsonable_encoder(payload)).body
+    _ROUTE_VIEW_CACHE.put(rev, key, body)
+    return Response(content=body, media_type="application/json")
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -88,106 +102,82 @@ def _closest_point_on_polyline(poly: List[Tuple[float, float]], lat: float, lon:
     1. Sammle alle orthogonalen Projektionen auf Segmente (NUR wo 0 ≤ t ≤ 1)
     2. Sammle alle direkten Distanzen zu GPS-Punkten (Vektoren)
     3. Minimum von allen = Ergebnis
+
+    Vectorised with numpy (audit 2026-11-24): the per-vertex Python loop was
+    2.8 s of a 4.7 s route/pretty call. Same arithmetic in the same order, so
+    results match the loop version; ties still prefer the first projection,
+    then the first vertex. The metric arrays are prepared once per polyline
+    object (polylines come from the per-track caches and are reused).
     """
     if len(poly) < 2:
         return (float('inf'), 0.0, lat, lon)
 
-    # Convert lat/lon to approximate meters (good enough for small areas)
-    # Using equirectangular approximation
-    ref_lat = poly[0][0]
-    meters_per_deg_lat = 111320.0
-    meters_per_deg_lon = 111320.0 * math.cos(math.radians(ref_lat))
+    lat0, lon0, mlat, mlon, xs, ys, abx, aby, ab_len_sq, seg_len, cum = _prepared_polyline(poly)
+    ax, ay = xs[:-1], ys[:-1]
 
-    def to_meters(lat_a, lon_a):
-        """Convert lat/lon to meters relative to first point"""
-        return (
-            (lat_a - poly[0][0]) * meters_per_deg_lat,
-            (lon_a - poly[0][1]) * meters_per_deg_lon
-        )
+    # Point P in meters (equirectangular approximation relative to poly[0])
+    px = (lat - lat0) * mlat
+    py = (lon - lon0) * mlon
 
-    # Point P in meters
-    px, py = to_meters(lat, lon)
+    best = None
+    # 1. Orthogonal projections, only for segments >= 10 cm and 0 <= t <= 1
+    valid = ab_len_sq >= 0.01
+    if valid.any():
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = ((px - ax) * abx + (py - ay) * aby) / ab_len_sq
+        ok = valid & (t >= 0) & (t <= 1)
+        if ok.any():
+            qx = ax + t * abx
+            qy = ay + t * aby
+            dx = px - qx
+            dy = py - qy
+            dist = np.sqrt(dx * dx + dy * dy)
+            dist = np.where(ok, dist, np.inf)
+            i = int(np.argmin(dist))  # first minimum, like min() over the list
+            along = cum[i] + t[i] * seg_len[i]
+            best = (float(dist[i]), float(along),
+                    lat0 + float(qx[i]) / mlat, lon0 + float(qy[i]) / mlon)
 
-    # Collect all candidate distances
-    candidates = []
+    # 2. Direct distances to every vertex
+    dvx = px - xs
+    dvy = py - ys
+    vdist = np.sqrt(dvx * dvx + dvy * dvy)
+    j = int(np.argmin(vdist))
+    if best is None or vdist[j] < best[0]:
+        best = (float(vdist[j]), float(cum[j]), poly[j][0], poly[j][1])
+    return best
 
-    total_along = 0.0
 
-    # 1. Check orthogonal projections on segments
-    for i in range(len(poly) - 1):
-        # Segment endpoints A and B
-        seg_start_lat, seg_start_lon = poly[i]
-        seg_end_lat, seg_end_lon = poly[i + 1]
+_PREPARED_POLYLINES: dict = {}
 
-        # Convert to meters
-        ax, ay = to_meters(seg_start_lat, seg_start_lon)
-        bx, by = to_meters(seg_end_lat, seg_end_lon)
 
-        # Vector AB
-        abx = bx - ax
-        aby = by - ay
+def _prepared_polyline(poly):
+    """Metric arrays for a polyline, cached by object identity.
 
-        # Vector AP
-        apx = px - ax
-        apy = py - ay
-
-        # Segment length squared
-        ab_len_sq = abx * abx + aby * aby
-
-        if ab_len_sq >= 0.01:  # Ignore very short segments (< 10cm)
-            # Projection parameter t = dot(AP, AB) / dot(AB, AB)
-            t = (apx * abx + apy * aby) / ab_len_sq
-
-            # ONLY use projection if WITHIN segment (0 ≤ t ≤ 1)
-            if 0 <= t <= 1:
-                # Projected point Q = A + t * AB
-                qx = ax + t * abx
-                qy = ay + t * aby
-
-                # Distance from P to Q (orthogonal distance)
-                pqx = px - qx
-                pqy = py - qy
-                dist = math.sqrt(pqx * pqx + pqy * pqy)
-
-                proj_along = total_along + t * math.sqrt(ab_len_sq)
-
-                # Convert projected point back to lat/lon
-                snap_x = qx + poly[0][0] * meters_per_deg_lat / meters_per_deg_lat
-                snap_y = qy + poly[0][1] * meters_per_deg_lon / meters_per_deg_lon
-                snap_lat = poly[0][0] + qx / meters_per_deg_lat
-                snap_lon = poly[0][1] + qy / meters_per_deg_lon
-
-                candidates.append((dist, proj_along, snap_lat, snap_lon))
-
-        # Accumulate distance along polyline
-        total_along += math.sqrt(ab_len_sq)
-
-    # 2. Check direct distances to all GPS points (Vektoren)
-    total_along = 0.0
-    for i, (point_lat, point_lon) in enumerate(poly):
-        vx, vy = to_meters(point_lat, point_lon)
-
-        # Direct distance from P to this GPS point
-        dx = px - vx
-        dy = py - vy
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        # Snap position is the GPS point itself
-        candidates.append((dist, total_along, point_lat, point_lon))
-
-        # Accumulate for next point
-        if i < len(poly) - 1:
-            next_lat, next_lon = poly[i + 1]
-            nx, ny = to_meters(next_lat, next_lon)
-            seg_len = math.sqrt((nx - vx)**2 + (ny - vy)**2)
-            total_along += seg_len
-
-    # 3. Find minimum
-    if not candidates:
-        return (float('inf'), 0.0, lat, lon)
-
-    min_dist, best_along, snap_lat, snap_lon = min(candidates, key=lambda x: x[0])
-    return (min_dist, best_along, snap_lat, snap_lon)
+    The entry keeps a reference to the list, so its id cannot be reused while
+    cached; a list that was mutated in place is detected by its length.
+    """
+    ent = _PREPARED_POLYLINES.get(id(poly))
+    if ent is not None and ent[0] is poly and ent[1] == len(poly):
+        return ent[2]
+    arr = np.asarray(poly, dtype=float)[:, :2]
+    lat0, lon0 = float(arr[0, 0]), float(arr[0, 1])
+    mlat = 111320.0
+    mlon = 111320.0 * math.cos(math.radians(lat0))
+    xs = (arr[:, 0] - lat0) * mlat
+    ys = (arr[:, 1] - lon0) * mlon
+    ax, ay = xs[:-1], ys[:-1]
+    abx = xs[1:] - ax
+    aby = ys[1:] - ay
+    ab_len_sq = abx * abx + aby * aby
+    seg_len = np.sqrt(ab_len_sq)
+    # cum[i] = along at vertex i, summed left to right like the loop did
+    cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+    prepared = (lat0, lon0, mlat, mlon, xs, ys, abx, aby, ab_len_sq, seg_len, cum)
+    if len(_PREPARED_POLYLINES) > 256:
+        _PREPARED_POLYLINES.clear()
+    _PREPARED_POLYLINES[id(poly)] = (poly, len(poly), prepared)
+    return prepared
 
 
 # Lateral distance (m) within which the user is considered "on" the route path.
@@ -198,7 +188,21 @@ ON_TRACK_THRESHOLD_M = 25.0
 # this every few meters — rebuilding the polyline from hundreds of rows on every
 # request is the one real hot path. TTL keeps it fresh enough for live editing.
 _POLYLINE_CACHE: dict = {}
-_POLYLINE_CACHE_TTL = 300.0  # seconds
+_POLYLINE_CACHE_TTL = 300.0  # seconds, only when track revisions are unavailable
+_POLYLINE_CACHE_TTL_REV = 3600.0  # with revisions the entry is exact; TTL just bounds memory
+
+
+def _geom_cache_valid(entry, rev, now) -> bool:
+    """entry = (expires, rev, ...). Exact on the track revision across all
+    workers; before revisions existed a route edit in one gunicorn worker left
+    the other three on old geometry for up to five minutes."""
+    if not entry or entry[0] <= now:
+        return False
+    return rev is None or entry[1] == rev
+
+
+def _geom_cache_expiry(rev, now) -> float:
+    return now + (_POLYLINE_CACHE_TTL if rev is None else _POLYLINE_CACHE_TTL_REV)
 
 # Plausibility cap for elevation deltas when summing ascent/descent: 100% = 45°.
 # Steeper single steps are recording artefacts (GPS altitude noise, gaps), not
@@ -215,9 +219,10 @@ def _get_track_polylines(db: Session, track_id: int) -> dict:
     are included (a polyline needs at least one segment).
     """
     now = time.monotonic()
+    rev = track_rev(db, track_id)
     cached = _POLYLINE_CACHE.get(track_id)
-    if cached and cached[0] > now:
-        return cached[1]
+    if _geom_cache_valid(cached, rev, now):
+        return cached[2]
 
     gps_points = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
@@ -230,7 +235,7 @@ def _get_track_polylines(db: Session, track_id: int) -> dict:
         grouped.setdefault(p.route_id, []).append((p.latitude, p.longitude))
     polylines = {rid: pts for rid, pts in grouped.items() if len(pts) >= 2}
 
-    _POLYLINE_CACHE[track_id] = (now + _POLYLINE_CACHE_TTL, polylines)
+    _POLYLINE_CACHE[track_id] = (_geom_cache_expiry(rev, now), rev, polylines)
     return polylines
 
 
@@ -256,9 +261,10 @@ def _get_membership_geometry(db: Session, track_id: int, track: Track):
     semantics of the runtime-snap path (created_by filter, timestamp order,
     column route_id with metadata_json.route_id fallback)."""
     now = time.monotonic()
+    rev = track_rev(db, track_id)
     cached = _MEMBERSHIP_GEOM_CACHE.get(track_id)
-    if cached and cached[0] > now:
-        return cached[1], cached[2]
+    if _geom_cache_valid(cached, rev, now):
+        return cached[2], cached[3]
 
     all_routes = guide_routes(db.query(TrackRouteModel).filter(TrackRouteModel.track_id == track_id).all())
     all_gps = db.query(Waypoint).filter(
@@ -279,7 +285,7 @@ def _get_membership_geometry(db: Session, track_id: int, track: Track):
             polylines[r.id] = pts
 
     route_ids = [r.id for r in all_routes]
-    _MEMBERSHIP_GEOM_CACHE[track_id] = (now + _POLYLINE_CACHE_TTL, route_ids, polylines)
+    _MEMBERSHIP_GEOM_CACHE[track_id] = (_geom_cache_expiry(rev, now), rev, route_ids, polylines)
     return route_ids, polylines
 
 
@@ -288,12 +294,13 @@ def _get_wp_route_distances(wp: Waypoint, track_id: int, db: Session, track: Tra
     memoized per (waypoint, position) so the 4-routes-in-a-row app startup pays
     the projection cost only once."""
     now = time.monotonic()
+    rev = track_rev(db, track_id)
     per_track = _WP_ROUTE_DIST_CACHE.get(track_id)
-    if not per_track or per_track[0] <= now:
-        per_track = (now + _POLYLINE_CACHE_TTL, {})
+    if not _geom_cache_valid(per_track, rev, now):
+        per_track = (_geom_cache_expiry(rev, now), rev, {})
         _WP_ROUTE_DIST_CACHE[track_id] = per_track
     key = (wp.id, wp.latitude, wp.longitude)
-    hit = per_track[1].get(key)
+    hit = per_track[2].get(key)
     if hit is not None:
         return hit
 
@@ -311,7 +318,7 @@ def _get_wp_route_distances(wp: Waypoint, track_id: int, db: Session, track: Tra
             'snap_lat': snap_lat,
             'snap_lon': snap_lon,
         })
-    per_track[1][key] = dists
+    per_track[2][key] = dists
     return dists
 
 
@@ -730,6 +737,12 @@ async def get_route_waypoint_ids(
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
 
+    rev = track_rev(db, track_id)
+    cache_key = ("waypoint-ids", track_id, route_id)
+    hit = _ROUTE_VIEW_CACHE.get(rev, cache_key)
+    if hit is not MISS:
+        return Response(content=hit, media_type="application/json")
+
     all_waypoints = db.query(Waypoint).filter(Waypoint.track_id == track_id, Waypoint.archived.isnot(True)).all()
     waypoint_ids = []
     segment_waypoint_ids = []
@@ -740,13 +753,13 @@ async def get_route_waypoint_ids(
         if _waypoint_belongs_to_route(wp, route_id, track_id, db, track):
             (segment_waypoint_ids if is_segment_marker else waypoint_ids).append(wp.id)
 
-    return {
+    return _cache_view(rev, cache_key, {
         "track_id": track_id,
         "route_id": route_id,
         "count": len(waypoint_ids),
         "waypoint_ids": waypoint_ids,
         "segment_waypoint_ids": segment_waypoint_ids,
-    }
+    })
 
 
 @router.get("/{track_id}/routes/{route_id}/polyline")
@@ -2596,6 +2609,12 @@ async def get_route_pretty(
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
 
+    rev = track_rev(db, track_id)
+    cache_key = ("pretty", track_id, route_id)
+    hit = _ROUTE_VIEW_CACHE.get(rev, cache_key)
+    if hit is not MISS:
+        return Response(content=hit, media_type="application/json")
+
     # Get GPS points for distance calculations
     gps_points = db.query(Waypoint).filter(
         Waypoint.track_id == track_id,
@@ -2681,14 +2700,14 @@ async def get_route_pretty(
     # Sort segments by start_km
     pretty_segments.sort(key=lambda x: x.start_km)
 
-    return PrettyRouteDetail(
+    return _cache_view(rev, cache_key, PrettyRouteDetail(
         route_id=route.id,
         route_name=route.name,
         route_description=route.description,
         total_km=round(total_distance / 1000, 2),
         pois=pretty_pois,
         segments=pretty_segments
-    )
+    ))
 
 
 class NarrativeCaptureRequest(BaseModel):
@@ -2888,6 +2907,52 @@ def _by_knowledge_query(db: Session, track_id: Optional[int], include_archived: 
     return q
 
 
+# knowledge key -> [(waypoint, meta)] per (track, include_archived), valid for
+# one track revision. The app resolves every species pin separately (~27k
+# calls in the audit window, each scanning ~2,500 waypoints with JSON, 270 ms);
+# with the index a call is a dict lookup.
+_BY_KNOWLEDGE_INDEX = TrackCache("by_knowledge_index", max_entries=64)
+
+
+def _by_knowledge_index(db: Session, track_id: int, include_archived: bool) -> dict:
+    def build():
+        index: dict = {}
+        for w in _by_knowledge_query(db, track_id, include_archived).order_by(Waypoint.id).all():
+            meta = w.metadata_json or {}
+            keys = _linked_knowledge_keys(meta)
+            if not keys:
+                continue
+            # Detach a plain snapshot: ORM rows must not outlive their session.
+            row = _WpRow(w.id, w.track_id, w.latitude, w.longitude, w.waypoint_type,
+                         bool(getattr(w, "archived", False)))
+            for k in keys:
+                index.setdefault(k, []).append((row, meta))
+        return index
+    return _BY_KNOWLEDGE_INDEX.get_or_build(track_rev(db, track_id), (track_id, include_archived), build)
+
+
+class _WpRow:
+    __slots__ = ("id", "track_id", "latitude", "longitude", "waypoint_type", "archived")
+
+    def __init__(self, id, track_id, latitude, longitude, waypoint_type, archived):
+        self.id, self.track_id, self.latitude, self.longitude = id, track_id, latitude, longitude
+        self.waypoint_type, self.archived = waypoint_type, archived
+
+
+def _by_knowledge_candidates(db: Session, track_id: Optional[int], include_archived: bool, keys) -> dict:
+    """{key: [(waypoint, meta)]} for the wanted keys, in waypoint-id order."""
+    if track_id is not None:
+        index = _by_knowledge_index(db, track_id, include_archived)
+        return {k: index.get(k, []) for k in keys}
+    # All tracks: rare, not cached.
+    out = {k: [] for k in keys}
+    for w in _by_knowledge_query(db, None, include_archived).order_by(Waypoint.id).all():
+        meta = w.metadata_json or {}
+        for k in _linked_knowledge_keys(meta) & set(keys):
+            out[k].append((w, meta))
+    return out
+
+
 @router.get("/waypoints/by-knowledge")
 def get_waypoints_by_knowledge_batch(
     ids: str,
@@ -2920,12 +2985,9 @@ def get_waypoints_by_knowledge_batch(
         raise HTTPException(status_code=400, detail="ids fehlt")
     if len(wanted) > 500:
         raise HTTPException(status_code=400, detail="ids: hoechstens 500")
-    wanted_set = set(wanted)
     results = {k: [] for k in wanted}
-    for w in _by_knowledge_query(db, track_id, include_archived).all():
-        meta = w.metadata_json or {}
-        linked = _linked_knowledge_keys(meta) & wanted_set
-        for k in linked:
+    for k, rows in _by_knowledge_candidates(db, track_id, include_archived, wanted).items():
+        for w, meta in rows:
             item = _by_knowledge_item(w, meta, int(k), primary_only)
             if item is not None:
                 results[k].append(item)
@@ -2966,10 +3028,7 @@ def get_waypoints_by_knowledge(
     # and JSON shapes (list-contains is awkward/non-portable in json_extract).
     key = str(knowledge_id)
     out = []
-    for w in _by_knowledge_query(db, track_id, include_archived).all():
-        meta = w.metadata_json or {}
-        if key not in _linked_knowledge_keys(meta):
-            continue
+    for w, meta in _by_knowledge_candidates(db, track_id, include_archived, [key])[key]:
         item = _by_knowledge_item(w, meta, knowledge_id, primary_only)
         if item is not None:
             out.append(item)

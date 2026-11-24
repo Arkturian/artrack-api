@@ -67,6 +67,10 @@ from artrack.routes import (
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
+# Missing indexes and the track revision triggers (track_cache). connect_db()
+# with the older SQLite migrations is never called, so this runs here.
+from artrack.database import _postgres_migrations
+_postgres_migrations()
 
 app = FastAPI(
     title="Artrack API",
@@ -91,6 +95,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Browsers cache the preflight for this long (Chrome caps at 2 h). Without
+    # it every cross-origin GET with X-API-KEY was preceded by an OPTIONS
+    # request: 29 % of all API requests in the audit of 2026-11-24.
+    max_age=7200,
 )
 
 # Include routers

@@ -214,6 +214,41 @@ async def connect_db():
         # Do not fail startup on migration errors; logs will show details
         pass
 
+
+def _postgres_migrations():
+    """Indexes the model never declared, and the track revision triggers.
+
+    waypoints had no index on track_id, so every per-track read was a full
+    table scan over all tracks (audit 2026-11-24).
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    import logging
+    log = logging.getLogger(__name__)
+    try:
+        wanted = {
+            "ix_waypoints_track_archived": "waypoints (track_id, archived)",
+            "ix_track_collaborators_track_user": "track_collaborators (track_id, user_id)",
+            "ix_tracks_created_by": "tracks (created_by)",
+        }
+        with engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(7301301)"))
+            # Look in the catalog first: even IF NOT EXISTS takes a table lock
+            # and would queue behind a long write at startup.
+            have = {r[0] for r in conn.execute(text(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"))}
+            for name, target in wanted.items():
+                if name not in have:
+                    conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {target}"))
+                    log.info("created index %s", name)
+    except Exception as e:
+        log.warning("index migration skipped: %s", e)
+    try:
+        from .services.track_cache import ensure_revision_triggers
+        ensure_revision_triggers(engine)
+    except Exception as e:
+        log.warning("track revision triggers not installed, caches stay off: %s", e)
+
 async def disconnect_db():
     """Disconnect from database (for shutdown)"""
     await database.disconnect()

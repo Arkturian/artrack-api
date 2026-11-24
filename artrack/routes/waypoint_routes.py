@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Header, BackgroundTasks, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from fastapi.encoders import jsonable_encoder
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -21,6 +22,7 @@ from ..models import (
 from ..auth import get_current_user
 from ..asset_urls import enrich_asset, enrich_assets_in_metadata, attach_hls_to_assets, resolve_hls_url
 from ..services.track_bbox import _haversine_m
+from ..services.track_cache import MISS, TrackCache, track_rev
 from artrack.storage_domain import save_file_and_record
 from clients.storage_client import generic_storage, enqueue_ai_safety_and_transcoding
 from ..analysis import analysis_service
@@ -242,6 +244,10 @@ async def get_waypoint_status(
         metadata_json=waypoint.metadata_json,
     )
 
+# Encoded waypoints/detail responses per (track, query), valid for one revision.
+_DETAIL_CACHE = TrackCache("waypoints_detail", max_entries=64, ttl=300.0)
+
+
 @router.get("/tracks/{track_id}/waypoints/detail", response_model=None)
 async def list_waypoints_detail(
     track_id: int,
@@ -264,6 +270,16 @@ async def list_waypoints_detail(
         if not can_read_track(track, current_user):
             raise HTTPException(status_code=403, detail="Access denied")
 
+    # Same payload for every reader, so cache the encoded response per track
+    # revision (exact: any waypoint/route write bumps it). The TTL only bounds
+    # the HLS state mixed in from storage-api.
+    rev = track_rev(db, track_id)
+    cache_key = (track_id, segment_id, waypoint_type, fields, exclude_segment_markers,
+                 include_archived, limit, offset)
+    cached = _DETAIL_CACHE.get(rev, cache_key)
+    if cached is not MISS:
+        return Response(content=cached, media_type="application/json")
+
     query = db.query(Waypoint).filter(Waypoint.track_id == track_id)
     if not include_archived:
         # Archived waypoints (old narration generations etc.) stay in the DB
@@ -275,7 +291,10 @@ async def list_waypoints_detail(
         types = [t.strip() for t in waypoint_type.split(",") if t.strip()]
         if types:
             query = query.filter(Waypoint.waypoint_type.in_(types))
-    waypoints = query.offset(offset).limit(limit).all()
+    # Stable order is required for offset paging: without it Postgres returns
+    # heap order, which shifts when rows are updated, so pages overlapped or
+    # skipped waypoints.
+    waypoints = query.order_by(Waypoint.id).offset(offset).limit(limit).all()
 
     if exclude_segment_markers:
         # segment start/end markers are structural, not balloon POIs — filtered
@@ -333,7 +352,9 @@ async def list_waypoints_detail(
                 "altitude": wp.altitude,
                 "archived": bool(getattr(wp, "archived", False)),
             })
-        return slim
+        body = JSONResponse(content=jsonable_encoder(slim)).body
+        _DETAIL_CACHE.put(rev, cache_key, body)
+        return Response(content=body, media_type="application/json")
 
     # Batch the media lookup: one IN-query instead of one query per waypoint.
     # The previous N+1 pattern was the dominant cost of this endpoint (~5s for
@@ -411,7 +432,9 @@ async def list_waypoints_detail(
                 url=m.get("url")
             , storage_object_id=m.get("storage_object_id")) for m in media]
         ))
-    return result
+    body = JSONResponse(content=jsonable_encoder(result)).body
+    _DETAIL_CACHE.put(rev, cache_key, body)
+    return Response(content=body, media_type="application/json")
 
 @router.get("/tracks/{track_id}/narration-points")
 async def list_narration_points(
