@@ -9,7 +9,6 @@ from ai_config import ai_config, AIAnalysisMode
 
 from artrack.config import settings
 
-INTERNAL_API_KEY = settings.AI_INTERNAL_API_KEY
 API_BASE_URL = "http://127.0.0.1:8001"  # Internal communication
 
 async def analyze_content_with_chatgpt(
@@ -211,7 +210,7 @@ BEISPIEL für Produkt:
     }
 
     headers = {
-        "X-API-KEY": INTERNAL_API_KEY,
+        **settings.ai_api_auth(),
         "Content-Type": "application/json"
     }
 
@@ -426,7 +425,7 @@ ANTWORT FORMAT (JSON):
     }
 
     headers = {
-        "X-API-KEY": INTERNAL_API_KEY,
+        **settings.ai_api_auth(),
         "Content-Type": "application/json"
     }
 
@@ -511,7 +510,7 @@ ANTWORT FORMAT (JSON):
     }
 
     headers = {
-        "X-API-KEY": INTERNAL_API_KEY,
+        **settings.ai_api_auth(),
         "Content-Type": "application/json"
     }
 

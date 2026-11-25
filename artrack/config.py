@@ -43,12 +43,20 @@ class Settings:
     # Ausgehende Schluessel. Sie gehoeren den Zieldiensten, nicht ARTrack, und
     # duerfen deshalb nicht am eigenen Master haengen.
     CONTENT_API_KEY: str = os.getenv("CONTENT_API_KEY", "")
+    # Zugang zu api-ai. Optional: Der alte gemeinsame Wert, der hier stand,
+    # oeffnet in api-ai nichts und ist entfernt (#3969). Braucht artrack-api
+    # einen Zugang, ist das ein eigener, eng gefasster von AiApi (Muster #3958).
     AI_API_KEY: str = os.getenv("AI_API_KEY", "")
     AI_INTERNAL_API_KEY: str = os.getenv("AI_INTERNAL_API_KEY", "")
-    REQUIRED_SECRETS = ("API_KEY", "JWT_SECRET", "CONTENT_API_KEY", "AI_API_KEY", "AI_INTERNAL_API_KEY")
+    REQUIRED_SECRETS = ("API_KEY", "JWT_SECRET", "CONTENT_API_KEY")
 
     def missing_secrets(self) -> list:
         return [name for name in self.REQUIRED_SECRETS if not getattr(self, name)]
+
+    def ai_api_auth(self, name: str = "AI_INTERNAL_API_KEY") -> dict:
+        """X-API-KEY for api-ai, only when a key is configured."""
+        key = getattr(self, name, "") or ""
+        return {"X-API-KEY": key} if key else {}
     # Anmeldung von Menschen ueber auth-api (OAuth 2.1 + PKCE, Post #5579).
     # Ohne AUTH_CLIENT_ID ist der Bearer-Weg aus, X-API-KEY bleibt unberuehrt.
     AUTH_API_BASE: str = os.getenv("AUTH_API_BASE", "https://auth-api.arkturian.com").rstrip("/")

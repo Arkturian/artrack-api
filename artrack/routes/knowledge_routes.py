@@ -85,7 +85,6 @@ def _set_job(job_id: str, job_data: Dict):
     _save_jobs(jobs)
 
 # AI API endpoint
-INTERNAL_API_KEY = settings.AI_INTERNAL_API_KEY
 AI_API_BASE = "https://api-ai.arkturian.com"
 
 
@@ -338,7 +337,7 @@ Antworte NUR mit dem Text, keine Erklärungen.
                     "temperature": 0.7
                 },
                 headers={
-                    "X-API-KEY": INTERNAL_API_KEY,
+                    **settings.ai_api_auth(),
                     "Content-Type": "application/json"
                 },
                 timeout=60.0
@@ -399,7 +398,7 @@ Dritter Cue zum Abschluss.
                     "temperature": 0.3  # Low temp for consistent splitting
                 },
                 headers={
-                    "X-API-KEY": INTERNAL_API_KEY,
+                    **settings.ai_api_auth(),
                     "Content-Type": "application/json"
                 },
                 timeout=60.0
@@ -1556,7 +1555,7 @@ async def generate_knowledge_audio(
                 response = await client.post(
                     f"{AI_API_BASE}/ai/dialog/start",
                     json=dialog_payload,
-                    headers={"X-API-KEY": INTERNAL_API_KEY, "Content-Type": "application/json"},
+                    headers={**settings.ai_api_auth(), "Content-Type": "application/json"},
                     timeout=30.0
                 )
 
@@ -1583,7 +1582,7 @@ async def generate_knowledge_audio(
                     status_resp = await client.get(
                         f"{AI_API_BASE}/ai/dialog/status",
                         params={"id": job_id},
-                        headers={"X-API-KEY": INTERNAL_API_KEY},
+                        headers=settings.ai_api_auth(),
                         timeout=30.0
                     )
 

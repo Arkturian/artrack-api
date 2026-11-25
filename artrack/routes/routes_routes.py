@@ -1207,7 +1207,10 @@ async def get_track_structure_report(
         report_text = generate_track_report(
             track_id=track_id,
             show_descriptions=full,
-            api_key=settings.AI_API_KEY,
+            # The report reads this API over loopback (AI_BASE_URL defaults to
+            # localhost:8001), so it needs artrack-api's own key. It used to send
+            # AI_API_KEY, which artrack never accepted: every report was a 502.
+            api_key=settings.API_KEY,
             base_url=settings.AI_BASE_URL.rstrip("/"),
         )
     except Exception as exc:
@@ -1387,9 +1390,8 @@ async def generate_route_intro(
 
         # AI Service Configuration
         AI_SERVICE_URL = "https://api-ai.arkturian.com"
-        AI_API_KEY = settings.AI_INTERNAL_API_KEY
         HEADERS = {
-            "X-API-KEY": AI_API_KEY,
+            **settings.ai_api_auth(),
             "Content-Type": "application/json"
         }
 
